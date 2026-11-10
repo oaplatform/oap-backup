@@ -1,0 +1,5 @@
+*.md
+.idea/
+*.iml
+.git/
+deploy/

@@ -1,0 +1,40 @@
+# RBAC for oap-backup watching all namespaces.
+# To restrict it to one namespace (--namespace=<ns>), use a Role/RoleBinding
+# in that namespace with the same rules instead.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: oap-backup
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oap-backup
+  namespace: oap-backup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: oap-backup
+rules:
+  # discover annotated pods; create/delete helper pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "create", "delete"]
+  # run the backup command (get: WebSocket exec, create: SPDY fallback)
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oap-backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: oap-backup
+subjects:
+  - kind: ServiceAccount
+    name: oap-backup
+    namespace: oap-backup

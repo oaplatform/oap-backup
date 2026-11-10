@@ -1,0 +1,37 @@
+# An application whose image has no archiving tools. The backup runs in a
+# helper pod (image alpine:3.22) on the same node, with the same volumes
+# mounted at the same paths. tar already produces gzip, so the extension
+# ends in .gz and oap-backup does not compress it again.
+# Schedule: every day at 03:15 Kyiv time; keep 14 backups.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uploads
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: uploads
+  template:
+    metadata:
+      labels:
+        app: uploads
+      annotations:
+        oap/backup-command: "tar -czf - -C /srv/uploads ."
+        oap/backup-schedule: "CRON_TZ=Europe/Kyiv 15 3 * * *"
+        oap/backup-file-folder: "app/uploads"
+        oap/backup-file-extension: ".tar.gz"
+        oap/backup-retention-keep-last: "14"
+        oap/backup-external-container-image: "alpine:3.22"
+    spec:
+      containers:
+        - name: uploads
+          image: example/uploads:1.0
+          volumeMounts:
+            - name: uploads
+              mountPath: /srv/uploads
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: uploads

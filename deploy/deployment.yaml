@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oap-backup
+  namespace: oap-backup
+spec:
+  # Exactly one replica: every replica would run every backup.
+  replicas: 1
+  # Recreate (not RollingUpdate) so old and new pods never run at the same time.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oap-backup
+  template:
+    metadata:
+      labels:
+        app: oap-backup
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: oap-backup
+      # > --shutdown_timeout, so running backups can finish on rollout.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: oap-backup
+          image: oap-backup:latest
+          args:
+            - --storage=ftp
+            - --ftp_addr=ftp.example.com:21
+            - --ftp_user=backup
+            - --ftp_folder=/backups
+            # - --ftp_tls
+            # --- or S3 ---
+            # - --storage=s3
+            # - --s3_endpoint=s3.eu-central-1.amazonaws.com
+            # - --s3_bucket=my-backups
+            # - --s3_prefix=prod
+            # - --s3_region=eu-central-1
+            - --default_schedule=30 1 * * *
+            - --timezone=UTC
+            - --max_concurrent=2
+            - --shutdown_timeout=45s
+          envFrom:
+            - secretRef:
+                name: oap-backup-storage
+          ports:
+            - name: http
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Backups are staged here before upload: size it for the largest
+        # compressed dump times --max_concurrent.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 20Gi
+---
+# In-cluster access to /metrics, /targets and POST /run. Do not expose it
+# outside the cluster: /run is unauthenticated.
+apiVersion: v1
+kind: Service
+metadata:
+  name: oap-backup
+  namespace: oap-backup
+  labels:
+    app: oap-backup
+spec:
+  selector:
+    app: oap-backup
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http

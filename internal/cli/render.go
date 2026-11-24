@@ -57,9 +57,9 @@ func renderDetail(w io.Writer, d api.TargetDetail, now time.Time) {
 		row("Helper image", t.ExternalImage)
 	}
 	if t.Parts {
-		row("Parts command", oneLine(t.PartsCommand))
+		row("Parts command", oneLine(t.PartsCommandDisplay()))
 	}
-	row("Command", oneLine(t.Command))
+	row("Command", oneLine(t.CommandDisplay()))
 	row("Schedule", t.Schedule)
 	row("Next run", fmt.Sprintf("%s (in %s)", d.NextRun.Format(timeLayout), shortDuration(d.NextRun.Sub(now))))
 	row("Folder", t.FileFolder)

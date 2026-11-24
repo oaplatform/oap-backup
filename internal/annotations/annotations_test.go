@@ -204,7 +204,7 @@ func TestParseParts(t *testing.T) {
 	if !tg.Parts || tg.PartsCommand != "/scripts/list-parts.sh" {
 		t.Fatalf("unexpected target %+v", tg)
 	}
-	if got := tg.PartCommand("p_1"); got != "pg_dump -t p_1" {
+	if got := ForPart(tg.Command, "p_1"); got != "pg_dump -t p_1" {
 		t.Errorf("PartCommand = %q", got)
 	}
 	if got := tg.PartFolder("p_1"); got != "postgres/p_1" {

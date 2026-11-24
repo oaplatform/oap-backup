@@ -56,7 +56,7 @@ Set on the **Pod**. With a Deployment or StatefulSet, put them in
 
 | Annotation | Required | Description |
 |---|---|---|
-| `oap/backup-command` | **yes** | Shell command whose **stdout** is the backup, run as `sh -c "<command>"`. Its presence opts the pod in. |
+| `oap/backup-command` | **yes** | Shell command whose **stdout** is the backup, run as `sh -c "<command>"`. Its presence opts the pod in. Instead of it you can use `oap/backup-command-configmap` or `oap/backup-command-secret`: see [Scripts in a ConfigMap or Secret](#scripts-in-a-configmap-or-secret). |
 | `oap/backup-schedule` | no | The pod's own schedule (see [Schedule syntax](#schedule-syntax)). Default: `--default_schedule` (`@daily`). |
 | `oap/backup-file-folder` | **yes** | Folder under the storage root, e.g. `db/postgres`. Leading/trailing `/` are ignored; `.` and `..` segments are rejected. |
 | `oap/backup-file-extension` | **yes** | File extension, e.g. `.sql`, `.archive.gz`. With `oap/backup-compression` `gzip` or `zstd`, `.gz` or `.zst` is appended, unless the extension already ends in `.gz` or `.zst`. |
@@ -66,7 +66,10 @@ Set on the **Pod**. With a Deployment or StatefulSet, put them in
 | `oap/backup-container` | no | Container to exec into (and whose volume mounts a helper pod copies). Must exist in the pod spec. Default: the first container. |
 | `oap/backup-external-container-image` | no | Run the command in a helper pod with this image instead of in the pod itself. Required with `oap/backup-parts`. |
 | `oap/backup-parts` | no | `true` enables [partitioned backups](#partitioned-backups). Default: `false`. |
-| `oap/backup-parts-command` | with parts | Shell command that prints the list of parts. |
+| `oap/backup-parts-command` | with parts | Shell command that prints the list of parts. Or `oap/backup-parts-command-configmap` / `-secret`. |
+| `oap/backup-command-configmap`, `oap/backup-command-secret` | no | Name of a ConfigMap / Secret in the pod's namespace that holds the backup command as a script. Replaces `oap/backup-command`. |
+| `oap/backup-command-field` | with the two above | Field of that ConfigMap / Secret that holds the script. |
+| `oap/backup-parts-command-configmap`, `oap/backup-parts-command-secret`, `oap/backup-parts-command-field` | no | The same for the parts command. |
 
 If a pod's annotations are invalid (missing required key, bad cron, unknown
 container, ...), oap-backup logs a warning naming the pod and the problem, and
@@ -157,6 +160,57 @@ Typical commands:
 The command runs through `sh -c` in the target container, so the container's
 environment variables (e.g. passwords) are available, and the image must
 contain `sh`.
+
+## Scripts in a ConfigMap or Secret
+
+Instead of writing a command into the annotation, you can keep it as a script
+in a ConfigMap or a Secret of the pod's namespace. This works for both
+commands:
+
+| Inline | From a ConfigMap | From a Secret | Field (required with a ConfigMap or Secret) |
+|---|---|---|---|
+| `oap/backup-command` | `oap/backup-command-configmap` | `oap/backup-command-secret` | `oap/backup-command-field` |
+| `oap/backup-parts-command` | `oap/backup-parts-command-configmap` | `oap/backup-parts-command-secret` | `oap/backup-parts-command-field` |
+
+```yaml
+annotations:
+  oap/backup-command-configmap: "pg-backup-scripts"   # name of the ConfigMap
+  oap/backup-command-field: "backup.sh"               # field that holds the script
+  oap/backup-file-folder: "db/postgres"
+  # ...
+```
+
+- The `-configmap` / `-secret` annotation is the object's **name**; the
+  `-field` annotation is the **field** (key) in its data. Both are required.
+- Use exactly one of the three forms per command. Two forms at once, a
+  reference without `-field`, or `-field` without a reference make the pod
+  invalid (see `oap-backup list`).
+- Any of `oap/backup-command`, `oap/backup-command-configmap` and
+  `oap/backup-command-secret` opts the pod in.
+- The script runs exactly like an inline command: as `sh -c "<script>"`, with
+  stdout as the backup. In a [partitioned backup](#partitioned-backups) every
+  `{PART_ID}` in the backup script is replaced by the part id, and the script
+  must contain it.
+- **The script is read when a backup starts** (again for every retry), not
+  when pods are scanned. An edited ConfigMap or Secret is used by the next
+  backup; no restart or `refresh` is needed.
+- So some errors only show when the backup runs, as a failed run (`oap-backup
+  run --wait`, `status`, the log, `oap_backup_runs_total{result="failure"}`):
+  the object or field does not exist, oap-backup may not read it, the script
+  is empty or larger than 128 KiB, or a partitioned backup script has no
+  `{PART_ID}`.
+- **The content of a script is never shown**: `list`, `describe`, `status`,
+  the API and the logs show the reference, e.g. `secret pg-secret/dump.sh`.
+  Inline commands are shown as before. What the script itself writes to
+  stderr is still logged.
+- Permissions: oap-backup needs `get` on `configmaps`, which
+  [`deploy/rbac.yaml`](deploy/rbac.yaml) grants. It grants **no** access to
+  Secrets: with a ClusterRole that would mean every Secret in the cluster.
+  `deploy/rbac.yaml` has the cluster-wide rule and a per-Secret `Role`, both
+  commented out; enable the one you want. Without it, a `-secret` reference
+  fails the run with "not allowed to read secret ...".
+
+See [`deploy/examples/script-configmap.yaml`](deploy/examples/script-configmap.yaml).
 
 ## Helper pods
 
@@ -509,6 +563,8 @@ Required permissions (ClusterRole, or a Role with `--namespace`):
 |---|---|---|
 | `pods` | `get`, `list`, `create`, `delete` | discovery, helper pods |
 | `pods/exec` | `get`, `create` | run the backup command (WebSocket / SPDY) |
+| `configmaps` | `get` | scripts referenced by `oap/backup-*-command-configmap` |
+| `secrets` | `get` | scripts referenced by `oap/backup-*-command-secret`. Not granted by `deploy/rbac.yaml`; see [Scripts in a ConfigMap or Secret](#scripts-in-a-configmap-or-secret). |
 
 Deployment notes:
 

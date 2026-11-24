@@ -137,6 +137,7 @@ func serve(args []string) {
 	runner := &backup.Runner{
 		Exec:          &kube.RemoteExecutor{Config: restCfg, Client: client},
 		Helpers:       helpers,
+		Scripts:       &kube.Scripts{Client: client},
 		Storage:       store,
 		Metrics:       m,
 		Logger:        logger,

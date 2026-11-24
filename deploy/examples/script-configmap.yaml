@@ -1,0 +1,83 @@
+# The same partitioned backup as parts.yaml, with both scripts in a ConfigMap
+# instead of pod annotations. Each annotation names the ConfigMap, and the
+# matching -field annotation (required) names the field with the script.
+#
+# oap-backup reads the scripts when a backup starts, so editing the ConfigMap
+# takes effect on the next run. It needs "get" on configmaps (deploy/rbac.yaml).
+#
+# For a script that contains credentials use a Secret the same way:
+#   oap/backup-command-secret: "<secret name>"
+#   oap/backup-command-field: "<field>"
+# That needs "get" on secrets, which deploy/rbac.yaml does not grant by default.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tenants-backup-scripts
+  namespace: app
+data:
+  # Prints one line per directory /srv/data/<part>:
+  #   <part>=<YYYYMMDDHHMMSS>   new, or modified after its last backup
+  #   <part>=SKIP               not modified
+  # The parts already on the storage come in PART_COUNT, PART<X>_ID and
+  # PART<X>_MT (timestamp of the newest backup).
+  list-parts.sh: |
+    cd /srv/data || exit 1
+    for dir in */; do
+      [ -d "$dir" ] || continue
+      id=${dir%/}
+      newest=$(find "$dir" -type f -exec stat -c %Y {} + | sort -n | tail -n 1)
+      mt=$(date -u -d "@${newest:-0}" +%Y%m%d%H%M%S)
+      last=
+      i=0
+      while [ "$i" -lt "$PART_COUNT" ]; do
+        eval "part_id=\$PART${i}_ID part_mt=\$PART${i}_MT"
+        if [ "$part_id" = "$id" ]; then last=$part_mt; fi
+        i=$((i + 1))
+      done
+      if [ -n "$last" ] && [ "$mt" -le "$last" ]; then
+        echo "$id=SKIP"
+      else
+        echo "$id=$mt"
+      fi
+    done
+  # Runs once per changed part; oap-backup replaces {PART_ID} with the part id.
+  # stdout is the backup.
+  backup-part.sh: |
+    tar -czf - -C "/srv/data/{PART_ID}" .
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tenants
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tenants
+  template:
+    metadata:
+      labels:
+        app: tenants
+      annotations:
+        oap/backup-parts: "true"
+        oap/backup-parts-command-configmap: "tenants-backup-scripts"
+        oap/backup-parts-command-field: "list-parts.sh"
+        oap/backup-command-configmap: "tenants-backup-scripts"
+        oap/backup-command-field: "backup-part.sh"
+        oap/backup-schedule: "0 */6 * * *"
+        oap/backup-file-folder: "app/tenants"
+        oap/backup-file-extension: ".tar.gz"
+        oap/backup-retention-keep-last: "5"
+        oap/backup-external-container-image: "alpine:3.22"
+    spec:
+      containers:
+        - name: tenants
+          image: example/tenants:1.0
+          volumeMounts:
+            - name: data
+              mountPath: /srv/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tenants-data

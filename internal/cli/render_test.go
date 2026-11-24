@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"oap-backup/internal/annotations"
+	"oap-backup/internal/api"
 	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 )
@@ -96,6 +97,26 @@ func TestCompression(t *testing.T) {
 	for want, target := range cases {
 		if got := compression(target); got != want {
 			t.Errorf("compression(%+v) = %q, want %q", target, got, want)
+		}
+	}
+}
+
+func TestRenderDetailShowsScriptReference(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	var d api.TargetDetail
+	d.Target = annotations.Target{
+		Namespace: "db", Pod: "pg-0", Container: "main", FileFolder: "db/pg", FileExtension: ".sql", Schedule: "@daily",
+		Parts:            true,
+		CommandFrom:      annotations.Ref{Kind: annotations.RefSecret, Name: "pg-secret", Field: "dump.sh"},
+		PartsCommandFrom: annotations.Ref{Kind: annotations.RefConfigMap, Name: "pg-scripts", Field: "list.sh"},
+	}
+	d.NextRun = now.Add(time.Hour)
+	var buf bytes.Buffer
+	renderDetail(&buf, d, now)
+	out := buf.String()
+	for _, want := range []string{"secret pg-secret/dump.sh", "configmap pg-scripts/list.sh"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("describe does not contain %q:\n%s", want, out)
 		}
 	}
 }

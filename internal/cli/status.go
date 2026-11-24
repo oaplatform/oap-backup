@@ -148,9 +148,9 @@ func renderInProgress(w io.Writer, p InProgress, lines int, now time.Time) {
 		row("Helper image", t.ExternalImage)
 	}
 	if t.Parts {
-		row("Parts command", oneLine(t.PartsCommand))
+		row("Parts command", oneLine(t.PartsCommandDisplay()))
 	}
-	row("Command", oneLine(t.Command))
+	row("Command", oneLine(t.CommandDisplay()))
 	row("Folder", t.FileFolder)
 	row("Compression", compression(t))
 	row("Previous run", lastRunLong(p.LastRun, now))

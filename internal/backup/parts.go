@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -75,12 +76,15 @@ func partsEnv(parts []remotePart) []corev1.EnvVar {
 //
 //  1. reads the stored parts and their newest backup timestamps;
 //  2. creates the helper pod with them in PART<X>_ID / PART<X>_MT;
-//  3. runs t.PartsCommand there, which prints "<part>=<YYYYMMDDHHMMSS>" for
-//     every new or changed part and "<part>=SKIP" for every unchanged one
-//     (a stored part it does not print no longer exists);
-//  4. for every changed part runs t.Command, with {PART_ID} replaced, in the
-//     same helper pod and uploads its output to
+//  3. runs the parts command there, which prints "<part>=<YYYYMMDDHHMMSS>"
+//     for every new or changed part and "<part>=SKIP" for every unchanged
+//     one (a stored part it does not print no longer exists);
+//  4. for every changed part runs the backup command, with {PART_ID}
+//     replaced, in the same helper pod and uploads its output to
 //     <file-folder>/<part>/backup-<that timestamp><suffix>.
+//
+// Both commands are read first (see script), so a missing script fails the
+// attempt before a helper pod exists.
 //
 // Steps 1-3 share one BackupTimeout and each part backup gets its own. A
 // failed part does not stop the others, but fails the attempt. A retry
@@ -89,6 +93,20 @@ func partsEnv(parts []remotePart) []corev1.EnvVar {
 func (r *Runner) partsAttempt(ctx context.Context, t annotations.Target, log *slog.Logger) (Result, error) {
 	listCtx, cancel := context.WithTimeout(ctx, r.BackupTimeout)
 	defer cancel()
+
+	partsCommand, err := r.script(listCtx, t, "parts command", t.PartsCommand, t.PartsCommandFrom)
+	if err != nil {
+		return Result{}, err
+	}
+	command, err := r.script(listCtx, t, "backup command", t.Command, t.CommandFrom)
+	if err != nil {
+		return Result{}, err
+	}
+	// An inline command was checked when the annotations were parsed.
+	if !strings.Contains(command, annotations.PartPlaceholder) {
+		return Result{}, fmt.Errorf("backup command (%s) must contain %s: without it every part would get the same backup",
+			t.CommandDisplay(), annotations.PartPlaceholder)
+	}
 
 	stored, err := r.remoteParts(listCtx, t, log)
 	if err != nil {
@@ -100,7 +118,7 @@ func (r *Runner) partsAttempt(ctx context.Context, t annotations.Target, log *sl
 	}
 	defer cleanup()
 
-	parts, err := r.listParts(listCtx, t, helper, log)
+	parts, err := r.listParts(listCtx, t, helper, partsCommand, log)
 	if err != nil {
 		return Result{}, err
 	}
@@ -135,7 +153,7 @@ func (r *Runner) partsAttempt(ctx context.Context, t annotations.Target, log *sl
 			errs = append(errs, err)
 			break
 		}
-		res, err := r.backupPart(ctx, t, p, helper, log)
+		res, err := r.backupPart(ctx, t, p, command, helper, log)
 		if err != nil {
 			log.Error("part backup failed", "part", p.ID, "error", err)
 			errs = append(errs, fmt.Errorf("part %s: %w", p.ID, err))
@@ -155,13 +173,13 @@ func (r *Runner) partsAttempt(ctx context.Context, t annotations.Target, log *sl
 	return total, errors.Join(errs...)
 }
 
-// listParts runs t.PartsCommand in the helper pod and parses its stdout.
-func (r *Runner) listParts(ctx context.Context, t annotations.Target, helper string, log *slog.Logger) ([]annotations.Part, error) {
-	log.Info("running parts command", "pod", helper, "command", t.PartsCommand)
+// listParts runs the parts command in the helper pod and parses its stdout.
+func (r *Runner) listParts(ctx context.Context, t annotations.Target, helper, partsCommand string, log *slog.Logger) ([]annotations.Part, error) {
+	log.Info("running parts command", "pod", helper, "command", t.PartsCommandDisplay())
 	stdout := &cappedBuffer{limit: maxPartsOutput}
 	stderr := &lineLogger{log: log, pod: helper}
 
-	err := r.Exec.Exec(ctx, t.Namespace, helper, kube.HelperContainer, []string{"sh", "-c", t.PartsCommand}, stdout, stderr)
+	err := r.Exec.Exec(ctx, t.Namespace, helper, kube.HelperContainer, []string{"sh", "-c", partsCommand}, stdout, stderr)
 	stderr.Flush()
 	if err != nil {
 		var exitErr *kube.ExitError
@@ -177,11 +195,17 @@ func (r *Runner) listParts(ctx context.Context, t annotations.Target, helper str
 	return parts, nil
 }
 
-// backupPart backs up one changed part, bounded by BackupTimeout.
-func (r *Runner) backupPart(ctx context.Context, t annotations.Target, p annotations.Part, helper string, log *slog.Logger) (Result, error) {
+// backupPart backs up one changed part with command (the backup command
+// before {PART_ID} is replaced), bounded by BackupTimeout.
+func (r *Runner) backupPart(ctx context.Context, t annotations.Target, p annotations.Part, command, helper string, log *slog.Logger) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.BackupTimeout)
 	defer cancel()
-	return r.backupTo(ctx, t, t.PartFolder(p.ID), t.FileName(p.Timestamp), t.PartCommand(p.ID),
+	// An inline command is logged as it runs; a script only by reference.
+	display := t.CommandDisplay()
+	if t.CommandFrom.IsZero() {
+		display = annotations.ForPart(command, p.ID)
+	}
+	return r.backupTo(ctx, t, t.PartFolder(p.ID), t.FileName(p.Timestamp), annotations.ForPart(command, p.ID), display,
 		helper, kube.HelperContainer, log.With("part", p.ID))
 }
 

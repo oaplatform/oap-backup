@@ -25,6 +25,18 @@ rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["get", "create"]
+  # read backup scripts referenced by oap/backup-command-configmap and
+  # oap/backup-parts-command-configmap
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  # Scripts in Secrets (oap/backup-command-secret, oap/backup-parts-command-secret)
+  # are NOT enabled here: in a ClusterRole this rule lets oap-backup read every
+  # Secret in the cluster. Uncomment it only if that is acceptable. Otherwise
+  # grant access to the specific Secrets with the Role at the end of this file.
+  # - apiGroups: [""]
+  #   resources: ["secrets"]
+  #   verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -38,3 +50,32 @@ subjects:
   - kind: ServiceAccount
     name: oap-backup
     namespace: oap-backup
+---
+# Optional: let oap-backup read only specific script Secrets. Create one such
+# Role and RoleBinding in every namespace that keeps backup scripts in a
+# Secret, and list those Secrets in resourceNames.
+#
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: oap-backup-script-secrets
+#   namespace: db
+# rules:
+#   - apiGroups: [""]
+#     resources: ["secrets"]
+#     resourceNames: ["pg-backup-scripts"]
+#     verbs: ["get"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: oap-backup-script-secrets
+#   namespace: db
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: Role
+#   name: oap-backup-script-secrets
+# subjects:
+#   - kind: ServiceAccount
+#     name: oap-backup
+#     namespace: oap-backup

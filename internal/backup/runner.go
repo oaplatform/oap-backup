@@ -26,10 +26,19 @@ type HelperManager interface {
 	Delete(ctx context.Context, namespace, name string) error
 }
 
-// Runner executes backups. All fields except Metrics and Now are required.
+// ScriptResolver reads a command script from a ConfigMap or Secret
+// (implemented by kube.Scripts).
+type ScriptResolver interface {
+	Resolve(ctx context.Context, namespace string, ref annotations.Ref) (string, error)
+}
+
+// Runner executes backups. All fields except Metrics and Now are required;
+// Scripts only for targets whose commands are scripts in a ConfigMap or
+// Secret.
 type Runner struct {
 	Exec    kube.Executor
 	Helpers HelperManager
+	Scripts ScriptResolver
 	Storage storage.Storage
 	Metrics *metrics.Metrics
 	Logger  *slog.Logger
@@ -157,6 +166,11 @@ func (r *Runner) attempt(ctx context.Context, t annotations.Target, log *slog.Lo
 	ctx, cancel := context.WithTimeout(ctx, r.BackupTimeout)
 	defer cancel()
 
+	command, err := r.script(ctx, t, "backup command", t.Command, t.CommandFrom)
+	if err != nil {
+		return Result{}, err
+	}
+
 	execPod, execContainer := t.Pod, t.Container
 	if t.ExternalImage != "" {
 		helper, cleanup, err := r.startHelper(ctx, t, nil, log)
@@ -167,7 +181,26 @@ func (r *Runner) attempt(ctx context.Context, t annotations.Target, log *slog.Lo
 		execPod, execContainer = helper, kube.HelperContainer
 	}
 
-	return r.Backup(ctx, t, execPod, execContainer, log)
+	return r.backupTo(ctx, t, t.FileFolder, t.FileName(r.now()), command, t.CommandDisplay(), execPod, execContainer, log)
+}
+
+// script returns the text of one of t's commands (what names it in errors):
+// inline as is, or read now from the ConfigMap or Secret that ref points at.
+// Reading it for every attempt means an edited script is used by the next
+// backup, and by a retry. The text of a referenced script must not be
+// logged: it may come from a Secret.
+func (r *Runner) script(ctx context.Context, t annotations.Target, what, inline string, ref annotations.Ref) (string, error) {
+	if ref.IsZero() {
+		return inline, nil
+	}
+	if r.Scripts == nil {
+		return "", fmt.Errorf("%s: reading scripts from a %s is not configured", what, ref.Kind)
+	}
+	text, err := r.Scripts.Resolve(ctx, t.Namespace, ref)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", what, err)
+	}
+	return text, nil
 }
 
 // startHelper creates t's helper pod with env on its container and returns
@@ -192,19 +225,13 @@ func (r *Runner) startHelper(ctx context.Context, t annotations.Target, env []co
 	return helper, cleanup, nil
 }
 
-// Backup execs t.Command in namespace t.Namespace, pod execPod, container
-// execContainer and uploads its output to
-// <file-folder>/backup-<timestamp><suffix>; see backupTo.
-func (r *Runner) Backup(ctx context.Context, t annotations.Target, execPod, execContainer string, log *slog.Logger) (Result, error) {
-	return r.backupTo(ctx, t, t.FileFolder, t.FileName(r.now()), t.Command, execPod, execContainer, log)
-}
-
 // backupTo execs command in namespace t.Namespace, pod execPod, container
 // execContainer, writes its stdout (compressed with t.Codec, unless t's
 // extension says it already is) to a temp file, and uploads the file as
-// <dir>/<name>. The temp file is always removed.
-func (r *Runner) backupTo(ctx context.Context, t annotations.Target, dir, name, command, execPod, execContainer string, log *slog.Logger) (Result, error) {
-	log.Info("running backup command", "pod", execPod, "container", execContainer, "command", command,
+// <dir>/<name>. The temp file is always removed. display is what the log
+// shows instead of command.
+func (r *Runner) backupTo(ctx context.Context, t annotations.Target, dir, name, command, display, execPod, execContainer string, log *slog.Logger) (Result, error) {
+	log.Info("running backup command", "pod", execPod, "container", execContainer, "command", display,
 		"dir", dir, "file", name)
 
 	f, err := os.CreateTemp(r.TmpDir, "oap-backup-*-"+name)

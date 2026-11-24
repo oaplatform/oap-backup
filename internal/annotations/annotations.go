@@ -13,8 +13,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// Pod annotations understood by oap-backup. The presence of Command opts a
-// pod in; all other keys are validated only for opted-in pods.
+// Pod annotations understood by oap-backup. A backup command (Command,
+// CommandConfigMap or CommandSecret) opts a pod in; all other keys are
+// validated only for opted-in pods.
 const (
 	Command           = "oap/backup-command"
 	Schedule          = "oap/backup-schedule"
@@ -27,7 +28,48 @@ const (
 	PartsCommand      = "oap/backup-parts-command"
 	Compression       = "oap/backup-compression"
 	CompressionLevel  = "oap/backup-compression-level"
+
+	// A command can instead be a script stored in a ConfigMap or Secret of
+	// the pod's namespace: the annotation holds the object's name and the
+	// matching *Field annotation, which is then required, the field in it.
+	CommandConfigMap      = "oap/backup-command-configmap"
+	CommandSecret         = "oap/backup-command-secret"
+	CommandField          = "oap/backup-command-field"
+	PartsCommandConfigMap = "oap/backup-parts-command-configmap"
+	PartsCommandSecret    = "oap/backup-parts-command-secret"
+	PartsCommandField     = "oap/backup-parts-command-field"
 )
+
+// Kinds of a Ref.
+const (
+	RefConfigMap = "configmap"
+	RefSecret    = "secret"
+)
+
+// Ref points at a script stored in one field of a ConfigMap or Secret in the
+// pod's namespace. The zero value means "no reference": the command is
+// inline.
+type Ref struct {
+	// Kind is RefConfigMap or RefSecret.
+	Kind string
+	// Name is the ConfigMap's or Secret's name.
+	Name string
+	// Field is the key of the script in its data.
+	Field string
+}
+
+// IsZero reports whether r is no reference.
+func (r Ref) IsZero() bool {
+	return r == Ref{}
+}
+
+// String renders r as "<kind> <name>/<field>", e.g. "configmap scripts/backup.sh".
+func (r Ref) String() string {
+	if r.IsZero() {
+		return ""
+	}
+	return r.Kind + " " + r.Name + "/" + r.Field
+}
 
 // Compression codecs (values of the Compression annotation). None, the
 // default, stores the command output as is.
@@ -79,10 +121,13 @@ func ParseSchedule(spec string) (cron.Schedule, error) {
 
 // Target is one pod to back up, as described by its annotations.
 type Target struct {
-	Namespace         string
-	Pod               string
-	Container         string
+	Namespace string
+	Pod       string
+	Container string
+	// Command is the inline backup command. It is empty when the command is
+	// the script that CommandFrom points at.
 	Command           string
+	CommandFrom       Ref
 	Schedule          string
 	FileFolder        string
 	FileExtension     string
@@ -90,10 +135,13 @@ type Target struct {
 	// ExternalImage, when set, makes the backup run in a helper pod using
 	// this image and the source container's volumes.
 	ExternalImage string
-	// Parts enables partitioned backups: PartsCommand lists the parts and
-	// Command (which contains PartPlaceholder) runs once per changed part.
-	Parts        bool
-	PartsCommand string
+	// Parts enables partitioned backups: the parts command (PartsCommand
+	// inline, or the script at PartsCommandFrom) lists the parts and the
+	// backup command, which contains PartPlaceholder, runs once per changed
+	// part.
+	Parts            bool
+	PartsCommand     string
+	PartsCommandFrom Ref
 	// Compression is the codec oap-backup compresses the command output
 	// with: None (also when empty), Gzip or Zstd. It is not used when the
 	// extension says the output is already compressed.
@@ -187,10 +235,27 @@ func (t Target) PartFolder(id string) string {
 	return t.FileFolder + "/" + id
 }
 
-// PartCommand is the backup command for one part: Command with every
+// CommandDisplay describes the backup command for people: the inline
+// command, or the reference to its script, never a script's content.
+func (t Target) CommandDisplay() string {
+	if !t.CommandFrom.IsZero() {
+		return t.CommandFrom.String()
+	}
+	return t.Command
+}
+
+// PartsCommandDisplay is CommandDisplay for the parts command.
+func (t Target) PartsCommandDisplay() string {
+	if !t.PartsCommandFrom.IsZero() {
+		return t.PartsCommandFrom.String()
+	}
+	return t.PartsCommand
+}
+
+// ForPart returns the backup command of one part: command with every
 // PartPlaceholder replaced by id.
-func (t Target) PartCommand(id string) string {
-	return strings.ReplaceAll(t.Command, PartPlaceholder, id)
+func ForPart(command, id string) string {
+	return strings.ReplaceAll(command, PartPlaceholder, id)
 }
 
 // FormatTimestamp renders ts as the UTC "YYYYMMDDHHMMSS" used in backup file
@@ -269,17 +334,75 @@ func ParsePartList(output string) ([]Part, error) {
 	return parts, nil
 }
 
+// commandKeys are the annotations of one command: inline, or a script in a
+// ConfigMap or Secret plus its field.
+type commandKeys struct {
+	inline, configMap, secret, field string
+}
+
+var (
+	backupCommandKeys = commandKeys{Command, CommandConfigMap, CommandSecret, CommandField}
+	partsCommandKeys  = commandKeys{PartsCommand, PartsCommandConfigMap, PartsCommandSecret, PartsCommandField}
+)
+
+// parseCommand reads one command from ann. present is false when none of its
+// annotations is set. Exactly one of the inline, ConfigMap and Secret forms
+// may be set; a reference requires the field annotation, and the field
+// annotation requires a reference.
+func parseCommand(ann map[string]string, keys commandKeys) (inline string, ref Ref, present bool, err error) {
+	var set []string
+	for _, key := range []string{keys.inline, keys.configMap, keys.secret} {
+		if _, ok := ann[key]; ok {
+			set = append(set, key)
+		}
+	}
+	field, hasField := ann[keys.field]
+	field = strings.TrimSpace(field)
+
+	switch {
+	case len(set) == 0 && !hasField:
+		return "", Ref{}, false, nil
+	case len(set) == 0:
+		return "", Ref{}, true, fmt.Errorf("annotation %s: requires %s or %s", keys.field, keys.configMap, keys.secret)
+	case len(set) > 1:
+		return "", Ref{}, true, fmt.Errorf("annotations %s: only one of them may be set", strings.Join(set, ", "))
+	}
+
+	if set[0] == keys.inline {
+		if hasField {
+			return "", Ref{}, true, fmt.Errorf("annotation %s: requires %s or %s, not %s", keys.field, keys.configMap, keys.secret, keys.inline)
+		}
+		inline = ann[keys.inline]
+		if strings.TrimSpace(inline) == "" {
+			return "", Ref{}, true, fmt.Errorf("annotation %s must not be empty", keys.inline)
+		}
+		return inline, Ref{}, true, nil
+	}
+
+	ref = Ref{Kind: RefConfigMap, Name: strings.TrimSpace(ann[set[0]]), Field: field}
+	if set[0] == keys.secret {
+		ref.Kind = RefSecret
+	}
+	if ref.Name == "" {
+		return "", Ref{}, true, fmt.Errorf("annotation %s must not be empty: it is the %s's name", set[0], ref.Kind)
+	}
+	if ref.Field == "" {
+		return "", Ref{}, true, fmt.Errorf("missing required annotation %s (%s is set)", keys.field, set[0])
+	}
+	return "", ref, true, nil
+}
+
 // Parse reads the oap/backup-* annotations of pod. ok is false (and err nil)
-// when the pod has no oap/backup-command annotation. A non-nil error names
-// the offending annotation; the pod must then be skipped.
+// when the pod has no backup command annotation. A non-nil error names the
+// offending annotation; the pod must then be skipped.
 func Parse(pod *corev1.Pod, defaultSchedule string) (target Target, ok bool, err error) {
 	ann := pod.Annotations
-	command, ok := ann[Command]
+	command, commandFrom, ok, err := parseCommand(ann, backupCommandKeys)
 	if !ok {
 		return Target{}, false, nil
 	}
-	if strings.TrimSpace(command) == "" {
-		return Target{}, true, fmt.Errorf("annotation %s must not be empty", Command)
+	if err != nil {
+		return Target{}, true, err
 	}
 
 	schedule := strings.TrimSpace(ann[Schedule])
@@ -348,15 +471,23 @@ func Parse(pod *corev1.Pod, defaultSchedule string) (target Target, ok bool, err
 		}
 	}
 	partsCommand := ""
+	var partsCommandFrom Ref
 	if parts {
-		partsCommand = ann[PartsCommand]
-		if strings.TrimSpace(partsCommand) == "" {
-			return Target{}, true, fmt.Errorf("missing required annotation %s (%s is true)", PartsCommand, Parts)
+		var present bool
+		partsCommand, partsCommandFrom, present, err = parseCommand(ann, partsCommandKeys)
+		if err != nil {
+			return Target{}, true, err
+		}
+		if !present {
+			return Target{}, true, fmt.Errorf("missing required annotation %s, %s or %s (%s is true)",
+				PartsCommand, PartsCommandConfigMap, PartsCommandSecret, Parts)
 		}
 		if externalImage == "" {
 			return Target{}, true, fmt.Errorf("missing required annotation %s (%s is true)", ExternalImage, Parts)
 		}
-		if !strings.Contains(command, PartPlaceholder) {
+		// A script's content is only known when the backup runs; the
+		// runner checks it then.
+		if commandFrom.IsZero() && !strings.Contains(command, PartPlaceholder) {
 			return Target{}, true, fmt.Errorf("annotation %s: must contain %s when %s is true", Command, PartPlaceholder, Parts)
 		}
 	}
@@ -366,6 +497,7 @@ func Parse(pod *corev1.Pod, defaultSchedule string) (target Target, ok bool, err
 		Pod:               pod.Name,
 		Container:         container,
 		Command:           command,
+		CommandFrom:       commandFrom,
 		Schedule:          schedule,
 		FileFolder:        folder,
 		FileExtension:     ext,
@@ -373,6 +505,7 @@ func Parse(pod *corev1.Pod, defaultSchedule string) (target Target, ok bool, err
 		ExternalImage:     externalImage,
 		Parts:             parts,
 		PartsCommand:      partsCommand,
+		PartsCommandFrom:  partsCommandFrom,
 		Compression:       compression,
 		CompressionLevel:  level,
 	}, true, nil

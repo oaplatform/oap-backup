@@ -41,6 +41,9 @@ const (
 // LastRun describes the most recent finished run of a target since
 // oap-backup started.
 type LastRun struct {
+	// Seq numbers the runs of this process, so that two runs can be told
+	// apart even if they finish within the same clock tick.
+	Seq int64 `json:"seq"`
 	// Trigger is TriggerSchedule or TriggerManual.
 	Trigger  string    `json:"trigger"`
 	Started  time.Time `json:"started"`
@@ -50,6 +53,17 @@ type LastRun struct {
 	// Files and SizeBytes describe what the run uploaded.
 	Files     int   `json:"files"`
 	SizeBytes int64 `json:"size_bytes"`
+}
+
+// CurrentRun describes a backup that is in progress.
+type CurrentRun struct {
+	// Trigger is TriggerSchedule or TriggerManual.
+	Trigger string `json:"trigger"`
+	// Triggered is when the run was requested.
+	Triggered time.Time `json:"triggered"`
+	// Started is when the backup itself began. It is nil while the run
+	// waits for a free slot (MaxConcurrent backups are already running).
+	Started *time.Time `json:"started,omitempty"`
 }
 
 // InvalidTarget is an opted-in pod that is skipped because of its annotations.
@@ -81,8 +95,10 @@ type Manager struct {
 	cron    *cron.Cron
 	entries map[string]*entry
 	running map[string]bool
+	current map[string]*CurrentRun
 	warned  map[string]string
 	lastRun map[string]*LastRun
+	runSeq  int64
 	closed  bool
 	sem     chan struct{}
 	wg      sync.WaitGroup
@@ -101,6 +117,8 @@ type TargetStatus struct {
 	Target  annotations.Target `json:"target"`
 	NextRun time.Time          `json:"next_run"`
 	Running bool               `json:"running"`
+	// CurrentRun is set while Running.
+	CurrentRun *CurrentRun `json:"current_run,omitempty"`
 	// LastRun is nil until a run of the target has finished.
 	LastRun *LastRun `json:"last_run,omitempty"`
 }
@@ -115,6 +133,7 @@ func (m *Manager) init() {
 		m.cron = cron.New(cron.WithLocation(loc))
 		m.entries = map[string]*entry{}
 		m.running = map[string]bool{}
+		m.current = map[string]*CurrentRun{}
 		m.warned = map[string]string{}
 		m.lastRun = map[string]*LastRun{}
 		n := m.MaxConcurrent
@@ -307,6 +326,7 @@ func (m *Manager) start(key, reason string) (annotations.Target, bool) {
 		return annotations.Target{}, false
 	}
 	m.running[key] = true
+	m.current[key] = &CurrentRun{Trigger: reason, Triggered: time.Now()}
 	m.wg.Add(1)
 	m.Logger.Info("backup triggered", "target", key, "trigger", reason)
 	return e.target, true
@@ -321,8 +341,11 @@ func (m *Manager) run(t annotations.Target, trigger string) {
 	defer func() {
 		m.mu.Lock()
 		delete(m.running, t.Key())
+		delete(m.current, t.Key())
 		// The target may have been unscheduled while the backup ran.
 		if _, ok := m.entries[t.Key()]; ok && last != nil {
+			m.runSeq++
+			last.Seq = m.runSeq
 			m.lastRun[t.Key()] = last
 		}
 		m.mu.Unlock()
@@ -336,6 +359,11 @@ func (m *Manager) run(t annotations.Target, trigger string) {
 	defer func() { <-m.sem }()
 
 	started := time.Now()
+	m.mu.Lock()
+	if cur := m.current[t.Key()]; cur != nil {
+		cur.Started = &started
+	}
+	m.mu.Unlock()
 	res, err := m.Runner.Run(m.jobCtx, t) // the runner logs the outcome
 	last = &LastRun{Trigger: trigger, Started: started, Finished: time.Now(), Files: res.Files, SizeBytes: res.SizeBytes}
 	if err != nil {
@@ -375,6 +403,10 @@ func (m *Manager) status(key string, e *entry, now time.Time) TargetStatus {
 	if last := m.lastRun[key]; last != nil {
 		copied := *last
 		st.LastRun = &copied
+	}
+	if cur := m.current[key]; cur != nil {
+		copied := *cur
+		st.CurrentRun = &copied
 	}
 	return st
 }

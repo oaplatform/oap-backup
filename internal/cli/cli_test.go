@@ -24,20 +24,26 @@ import (
 	"oap-backup/internal/api"
 	"oap-backup/internal/backup"
 	"oap-backup/internal/cli"
+	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 )
 
-// fakeJob is the backup runner behind the service under test.
+// fakeJob is the backup runner behind the service under test. Like the real
+// one, it logs with the target attribute.
 type fakeJob struct {
-	mu    sync.Mutex
-	block chan struct{}
-	err   error
+	mu     sync.Mutex
+	block  chan struct{}
+	err    error
+	logger *slog.Logger
 }
 
-func (f *fakeJob) Run(ctx context.Context, _ annotations.Target) (scheduler.RunResult, error) {
+func (f *fakeJob) Run(ctx context.Context, t annotations.Target) (scheduler.RunResult, error) {
 	f.mu.Lock()
 	block, err := f.block, f.err
 	f.mu.Unlock()
+	log := f.logger.With("target", t.Key(), "folder", t.FileFolder)
+	log.Info("running backup command", "pod", t.Pod, "command", t.Command)
+	defer log.Info("prune complete", "deleted", 0, "kept", 1)
 	if block != nil {
 		select {
 		case <-block:
@@ -111,8 +117,9 @@ func newEnv(t *testing.T) *env {
 		}),
 		pod("broken", map[string]string{annotations.FileFolder: ""}),
 	)
-	job := &fakeJob{}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logs := runlog.New(0)
+	logger := slog.New(logs.Handler(slog.NewTextHandler(io.Discard, nil)))
+	job := &fakeJob{logger: logger}
 	mgr := &scheduler.Manager{
 		Client: client, DefaultSchedule: "@daily", Refresh: time.Minute, MaxConcurrent: 2,
 		ShutdownTimeout: time.Second, Runner: job, Logger: logger,
@@ -134,13 +141,29 @@ func newEnv(t *testing.T) *env {
 	}}
 	srv := httptest.NewServer((&api.Server{
 		Metrics:   http.NotFoundHandler(),
-		Scheduler: mgr, Inspector: inspector,
+		Scheduler: mgr, Inspector: inspector, Logs: logs,
 		StorageLocation: "s3://bucket/prefix (endpoint s3.local)",
 		InspectTimeout:  time.Second,
 		Logger:          logger,
 	}).Handler())
 	t.Cleanup(srv.Close)
 	return &env{client: client, server: srv, job: job, inspector: inspector}
+}
+
+// waitIdle waits until no backup is running.
+func (e *env) waitIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, out, _ := e.run("list", "-o", "json")
+		if !strings.Contains(out, `"running": true`) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backups still running:\n%s", out)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // run executes the CLI against the test service and returns its exit code,
@@ -154,6 +177,7 @@ func (e *env) run(args ...string) (int, string, string) {
 		return ""
 	}, &stdout, &stderr)
 	app.PollInterval = 5 * time.Millisecond
+	app.QuietInterval = 20 * time.Millisecond
 	return app.Run(args), stdout.String(), stderr.String()
 }
 
@@ -292,6 +316,32 @@ func TestRun(t *testing.T) {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, out, stderr)
 	}
 	wantContains(t, out, "started backup of db/pg-0", "db/pg-0: ok in ", "1 file, 2.0 KiB uploaded")
+	// The service's log of this run, from the trigger to the last line,
+	// before the result.
+	wantContains(t, out,
+		"INFO  backup triggered trigger=manual",
+		"INFO  running backup command folder=db/pg-0 pod=pg-0 command=pg_dumpall",
+		"INFO  prune complete folder=db/pg-0 deleted=0 kept=1")
+	if strings.Index(out, "prune complete") > strings.Index(out, "db/pg-0: ok in ") {
+		t.Errorf("the log must come before the result:\n%s", out)
+	}
+	if strings.Contains(out, "[db/pg-0]") {
+		t.Errorf("a single target needs no prefix:\n%s", out)
+	}
+
+	// A second run prints only its own log, not the first one again.
+	_, out, _ = e.run("run", "db/pg-0", "--wait")
+	if n := strings.Count(out, "running backup command"); n != 1 {
+		t.Errorf("second run printed %d runs:\n%s", n, out)
+	}
+
+	// Without --wait there is no log, only a hint.
+	_, out, _ = e.run("run", "db/parts-0")
+	wantContains(t, out, "started backup of db/parts-0", "Add --wait")
+	if strings.Contains(out, "running backup command") {
+		t.Errorf("no log expected without --wait:\n%s", out)
+	}
+	e.waitIdle(t)
 
 	// The finished run shows up in list and describe.
 	_, out, _ = e.run("list")
@@ -351,28 +401,132 @@ func TestRunAlreadyRunningAndAll(t *testing.T) {
 		t.Errorf("db/pg-0 is running and must not be started again:\n%s", out)
 	}
 	wantContains(t, stderr, "timed out after 50ms; still running: db/parts-0")
+	// While the backup is silent, --wait shows that it is still running.
+	wantContains(t, out, "running backup command", "... still running after ")
 
 	// Once the backups are unblocked, --all --wait reports every result.
 	close(block)
 	e.job.mu.Lock()
 	e.job.block = nil
 	e.job.mu.Unlock()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, out, _ = e.run("list")
-		if !strings.Contains(out, "running") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("backups still running:\n%s", out)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	e.waitIdle(t)
 	code, out, stderr = e.run("run", "--all", "--wait")
 	if code != cli.ExitOK {
 		t.Fatalf("exit %d, out %q, stderr %q", code, out, stderr)
 	}
-	wantContains(t, out, "db/parts-0: ok in ", "db/pg-0: ok in ")
+	wantContains(t, out, "db/parts-0: ok in ", "db/pg-0: ok in ",
+		"[db/pg-0]   ", "[db/parts-0]   ", "running backup command folder=db/parts-0")
+}
+
+func TestStatus(t *testing.T) {
+	e := newEnv(t)
+
+	code, out, stderr := e.run("status")
+	if code != cli.ExitOK {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	wantContains(t, out, "2 scheduled, 1 invalid, 0 in progress", "Next run:", "schedule 0 */6 * * *", "No backup in progress.")
+	if strings.Contains(out, "Last run failed") {
+		t.Errorf("nothing failed yet:\n%s", out)
+	}
+
+	// A failed run is reported until the next successful one.
+	e.job.mu.Lock()
+	e.job.err = errors.New("backup command exited with code 2")
+	e.job.mu.Unlock()
+	e.run("run", "db/parts-0", "--wait")
+	e.job.mu.Lock()
+	e.job.err = nil
+	block := make(chan struct{})
+	e.job.block = block
+	e.job.mu.Unlock()
+	_, out, _ = e.run("status")
+	wantContains(t, out, "Last run failed:", "db/parts-0, ", "backup command exited with code 2", "No backup in progress.")
+
+	// A backup in progress: its details and the log of this run only.
+	e.run("run", "db/pg-0")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, out, _ = e.run("status")
+		if strings.Contains(out, "running backup command") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	wantContains(t, out,
+		"2 scheduled, 1 invalid, 1 in progress",
+		"Backup in progress: db/pg-0",
+		"State:", "running for ", "Trigger:", "manual, at ",
+		"Mode:", "single", "Command:", "pg_dumpall", "Folder:", "db/pg-0", "Compression:", "gzip",
+		"Previous run:", "none since oap-backup started",
+		"Log:", "INFO  backup triggered trigger=manual", "INFO  running backup command folder=db/pg-0")
+	if strings.Contains(out, "backup scheduled") {
+		t.Errorf("the log must start at this run's trigger:\n%s", out)
+	}
+
+	// --lines limits the log, --lines 0 hides it.
+	_, out, _ = e.run("status", "--lines", "1")
+	wantContains(t, out, "Log (last 1 of 2 lines):", "running backup command")
+	if strings.Contains(out, "backup triggered") {
+		t.Errorf("--lines 1 printed more than one line:\n%s", out)
+	}
+	_, out, _ = e.run("status", "--lines=0")
+	if strings.Contains(out, "Log") || !strings.Contains(out, "Backup in progress: db/pg-0") {
+		t.Errorf("--lines 0:\n%s", out)
+	}
+
+	code, out, _ = e.run("status", "-o", "json")
+	var report cli.StatusReport
+	if err := json.Unmarshal([]byte(out), &report); code != cli.ExitOK || err != nil {
+		t.Fatalf("exit %d, json error %v:\n%s", code, err, out)
+	}
+	if report.Scheduled != 2 || report.Invalid != 1 || len(report.Failed) != 1 || report.Next == nil || len(report.InProgress) != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	p := report.InProgress[0]
+	if p.Target.Key() != "db/pg-0" || p.CurrentRun == nil || p.CurrentRun.Started == nil || p.CurrentRun.Trigger != scheduler.TriggerManual || len(p.Log) != 2 {
+		t.Errorf("in progress = %+v", p)
+	}
+
+	close(block)
+	e.waitIdle(t)
+	_, out, _ = e.run("status")
+	wantContains(t, out, "0 in progress", "No backup in progress.")
+
+	for _, args := range [][]string{{"status", "db/pg-0"}, {"status", "--lines", "-1"}, {"status", "-o", "yaml"}} {
+		if code, _, _ := e.run(args...); code != cli.ExitUsage {
+			t.Errorf("%v: exit %d, want usage error", args, code)
+		}
+	}
+}
+
+func TestLogEndpoint(t *testing.T) {
+	e := newEnv(t)
+	get := func(path string) (int, api.LogResponse) {
+		t.Helper()
+		resp, err := http.Get(e.server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out api.LogResponse
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	// Scheduling the pod is already part of its log.
+	code, log := get("/targets/db/pg-0/log")
+	if code != http.StatusOK || len(log.Lines) != 1 || !strings.Contains(log.Lines[0].Text, "backup scheduled") || log.Next != 1 {
+		t.Fatalf("log = %d %+v", code, log)
+	}
+	if code, log := get("/targets/db/pg-0/log?after=1"); code != http.StatusOK || len(log.Lines) != 0 || log.Next != 1 {
+		t.Errorf("after=1: %d %+v", code, log)
+	}
+	if code, _ := get("/targets/db/pg-0/log?after=x"); code != http.StatusBadRequest {
+		t.Errorf("after=x: status %d", code)
+	}
+	if code, _ := get("/targets/db/nope/log"); code != http.StatusNotFound {
+		t.Errorf("unknown target: status %d", code)
+	}
 }
 
 func TestUsageErrors(t *testing.T) {
@@ -434,7 +588,7 @@ func TestServerFlagAndUnreachable(t *testing.T) {
 }
 
 func TestIsCommand(t *testing.T) {
-	for _, c := range []string{"list", "describe", "run", "refresh", "help"} {
+	for _, c := range []string{"list", "describe", "run", "refresh", "status", "help"} {
 		if !cli.IsCommand(c) {
 			t.Errorf("IsCommand(%q) = false", c)
 		}

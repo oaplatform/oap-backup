@@ -181,6 +181,21 @@ func TestTrigger(t *testing.T) {
 	if err != nil || len(started) != 1 {
 		t.Fatalf("Trigger(db/a) = %v, %v", started, err)
 	}
+	// db/a is in progress. MaxConcurrent is 2, so it has a slot and starts.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, _ := m.Target("db/a")
+		if !st.Running || st.CurrentRun == nil || st.CurrentRun.Trigger != TriggerManual || st.CurrentRun.Triggered.IsZero() {
+			t.Fatalf("status of running target = %+v", st)
+		}
+		if st.CurrentRun.Started != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backup did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	// Still running: a second trigger of the same target is skipped.
 	started, _ = m.Trigger("")
 	if len(started) != 1 || started[0] != "db/b" {
@@ -195,7 +210,7 @@ func TestTrigger(t *testing.T) {
 		}
 	}
 	m.wg.Wait()
-	if len(m.Targets()) != 2 || m.Targets()[0].Running {
+	if len(m.Targets()) != 2 || m.Targets()[0].Running || m.Targets()[0].CurrentRun != nil {
 		t.Errorf("unexpected status %+v", m.Targets())
 	}
 }
@@ -257,7 +272,7 @@ func TestLastRun(t *testing.T) {
 	if st.Running || st.LastRun == nil {
 		t.Fatalf("status = %+v", st)
 	}
-	if l := st.LastRun; l.Trigger != TriggerManual || l.Error != "" || l.Files != 2 || l.SizeBytes != 300 ||
+	if l := st.LastRun; l.Seq != 1 || l.Trigger != TriggerManual || l.Error != "" || l.Files != 2 || l.SizeBytes != 300 ||
 		l.Started.IsZero() || l.Finished.Before(l.Started) {
 		t.Errorf("last run = %+v", l)
 	}
@@ -266,7 +281,7 @@ func TestLastRun(t *testing.T) {
 	m.runScheduled("db/a")
 	<-r.done
 	st, _ = m.Target("db/a")
-	if l := st.LastRun; l == nil || l.Trigger != TriggerSchedule || l.Error != "boom" || l.Files != 0 {
+	if l := st.LastRun; l == nil || l.Trigger != TriggerSchedule || l.Error != "boom" || l.Files != 0 || l.Seq != 2 {
 		t.Errorf("last run after failure = %+v", l)
 	}
 
@@ -278,4 +293,42 @@ func TestLastRun(t *testing.T) {
 	if len(m.lastRun) != 0 {
 		t.Errorf("lastRun = %v, want empty", m.lastRun)
 	}
+}
+
+func TestCurrentRunQueued(t *testing.T) {
+	client := fake.NewClientset(annotatedPod("db", "a", ""), annotatedPod("db", "b", ""))
+	r := &fakeRunner{block: make(chan struct{}), done: make(chan string, 2)}
+	m := newManager(client, r)
+	m.MaxConcurrent = 1
+	m.Reconcile(context.Background())
+
+	if started, _ := m.Trigger(""); len(started) != 2 {
+		t.Fatalf("started = %v", started)
+	}
+	// One of the two gets the only slot; the other one waits for it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		running, queued := 0, 0
+		for _, st := range m.Targets() {
+			if st.CurrentRun == nil {
+				t.Fatalf("no current run: %+v", st)
+			}
+			if st.CurrentRun.Started != nil {
+				running++
+			} else {
+				queued++
+			}
+		}
+		if running == 1 && queued == 1 {
+			break
+		}
+		if running > 1 || time.Now().After(deadline) {
+			t.Fatalf("running = %d, queued = %d", running, queued)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(r.block)
+	<-r.done
+	<-r.done
+	m.wg.Wait()
 }

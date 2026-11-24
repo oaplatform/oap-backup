@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/backup"
+	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 )
 
@@ -44,6 +46,18 @@ type Storage struct {
 // RunResponse is the response of POST /run.
 type RunResponse struct {
 	Started []string `json:"started"`
+	// LogAfter is, for every started target, the log cursor from just
+	// before its backup was triggered: GET .../log?after=<cursor> returns
+	// the log of this run from its first line.
+	LogAfter map[string]int64 `json:"log_after"`
+}
+
+// LogResponse is the response of GET /targets/{namespace}/{pod}/log.
+type LogResponse struct {
+	// Lines are the recorded lines after the requested cursor, oldest first.
+	Lines []runlog.Line `json:"lines"`
+	// Next is the cursor to pass as "after" to get only newer lines.
+	Next int64 `json:"next"`
 }
 
 // ErrorResponse is the body of every non-2xx response.
@@ -65,12 +79,19 @@ type Inspector interface {
 	Inspect(ctx context.Context, t annotations.Target) ([]backup.StoredFolder, error)
 }
 
+// LogSource holds the recent log lines of every target (runlog.Recorder).
+type LogSource interface {
+	Cursor(target string) int64
+	Lines(target string, after int64) ([]runlog.Line, int64)
+}
+
 // Server serves the API. All fields are required.
 type Server struct {
 	// Metrics serves GET /metrics.
 	Metrics   http.Handler
 	Scheduler Scheduler
 	Inspector Inspector
+	Logs      LogSource
 	// StorageLocation describes the storage root, for display.
 	StorageLocation string
 	// InspectTimeout bounds reading the storage, or re-listing the pods,
@@ -88,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /targets", s.listTargets)
 	mux.HandleFunc("GET /targets/{namespace}/{pod}", s.describeTarget)
+	mux.HandleFunc("GET /targets/{namespace}/{pod}/log", s.targetLog)
 	mux.HandleFunc("POST /run", s.run)
 	mux.HandleFunc("POST /refresh", s.refresh)
 	return mux
@@ -135,8 +157,39 @@ func (s *Server) describeTarget(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, detail)
 }
 
+// targetLog returns the recent log lines of one target, recorded since
+// oap-backup started: its backup runs, schedule changes and prunes.
+func (s *Server) targetLog(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("namespace") + "/" + r.PathValue("pod")
+	if _, ok := s.Scheduler.Target(key); !ok {
+		writeError(w, http.StatusNotFound, unknownTarget(key))
+		return
+	}
+	var after int64
+	if raw := r.URL.Query().Get("after"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("after=%q: must be a non-negative integer", raw))
+			return
+		}
+		after = n
+	}
+	lines, next := s.Logs.Lines(key, after)
+	writeJSON(w, http.StatusOK, LogResponse{Lines: lines, Next: next})
+}
+
 func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("target")
+	// The cursors are taken before the trigger, so that the log of the run
+	// includes its very first line.
+	logAfter := map[string]int64{}
+	if target != "" {
+		logAfter[target] = s.Logs.Cursor(target)
+	} else {
+		for _, t := range s.Scheduler.Targets() {
+			logAfter[t.Target.Key()] = s.Logs.Cursor(t.Target.Key())
+		}
+	}
 	started, err := s.Scheduler.Trigger(target)
 	if errors.Is(err, scheduler.ErrUnknownTarget) {
 		writeError(w, http.StatusNotFound, unknownTarget(target))
@@ -158,8 +211,12 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	if all == "" {
 		all = "<all>"
 	}
-	s.Logger.Info("manual backup requested", "target", all, "started", strings.Join(started, ","))
-	writeJSON(w, http.StatusAccepted, RunResponse{Started: started})
+	s.Logger.Info("manual backup requested", "requested", all, "started", strings.Join(started, ","))
+	resp := RunResponse{Started: started, LogAfter: map[string]int64{}}
+	for _, key := range started {
+		resp.LogAfter[key] = logAfter[key]
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func unknownTarget(key string) string {

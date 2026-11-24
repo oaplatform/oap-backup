@@ -35,6 +35,7 @@ import (
 	"oap-backup/internal/config"
 	"oap-backup/internal/kube"
 	"oap-backup/internal/metrics"
+	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 	"oap-backup/internal/storage"
 )
@@ -104,7 +105,8 @@ func serve(args []string) {
 		os.Exit(2)
 	}
 
-	logger := newLogger(cfg.LogLevel)
+	logs := runlog.New(0)
+	logger := newLogger(cfg.LogLevel, logs)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -187,6 +189,7 @@ func serve(args []string) {
 			Metrics:         promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}),
 			Scheduler:       mgr,
 			Inspector:       runner,
+			Logs:            logs,
 			StorageLocation: storageDescription(cfg),
 			InspectTimeout:  time.Minute,
 			Logger:          logger,
@@ -266,7 +269,9 @@ func orAll(s string) string {
 	return s
 }
 
-func newLogger(level string) *slog.Logger {
+// newLogger logs to stderr at level. Records of a backup target are also
+// kept in logs, for oap-backup run --wait.
+func newLogger(level string, logs *runlog.Recorder) *slog.Logger {
 	var lvl slog.Level
 	switch strings.ToLower(level) {
 	case "debug":
@@ -281,7 +286,7 @@ func newLogger(level string) *slog.Logger {
 		lvl = slog.LevelInfo
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	logger := slog.New(logs.Handler(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
 	if _, ok := knownLevels[strings.ToLower(level)]; level != "" && !ok {
 		logger.Warn("unknown --loglevel, defaulting to info", "loglevel", level)
 	}

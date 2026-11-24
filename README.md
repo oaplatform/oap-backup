@@ -326,6 +326,7 @@ alias oapb='kubectl -n oap-backup exec deploy/oap-backup -- /oap-backup'
 
 oapb list                          # backups that oap-backup detected
 oapb describe db/postgres-0        # everything about one backup
+oapb status                        # what is running now
 oapb refresh                       # rescan the pods now
 oapb run db/postgres-0 --wait      # back up this pod now
 ```
@@ -333,15 +334,21 @@ oapb run db/postgres-0 --wait      # back up this pod now
 | Command | Description |
 |---|---|
 | `list [-o table\|json]` | Every pod with `oap/backup-command`: status (`scheduled` / `running`), mode (`single` / `parts`), schedule, time to the next run, result of the last run, folder. Pods skipped because of invalid annotations are listed below, with the error. |
+| `status [--lines <n>] [-o table\|json]` | What oap-backup is doing now: how many pods are scheduled, invalid and being backed up, the next scheduled run, and the pods whose last run failed. For every backup in progress: whether it is running (and for how long) or queued for a free slot (`--max_concurrent`), what triggered it, its settings, the previous run, and the last `--lines` (15) lines of its log. `--lines 0` hides the log. |
 | `describe <namespace>/<pod> [-o table\|json]` | The parsed annotations, next run, last run (trigger, start, duration, uploaded files and size, error), and the storage: every file in the backup folder with its backup time and size, newest first. For [partitioned backups](#partitioned-backups): the same for every part folder. Files that the next retention run deletes are marked. |
 | `refresh [-o table\|json]` | Rescan the pods now, without waiting for the next periodic scan (`--refresh`, 60s), and print the same list as `list`. Use it right after you changed a pod's `oap/backup-*` annotations. It fails if the Kubernetes API cannot be reached; the current schedules are then kept. |
 | `run <namespace>/<pod> [--wait] [--timeout <duration>]` | Start a backup of the pod now. It fails if the pod is not scheduled or its backup is already running. |
 | `run --all [--wait] [--timeout <duration>]` | Start a backup of every scheduled pod that is not running one. |
 | `help`, `-h`, `--help` | Print the help: the commands, and how to start the service with all its flags. Running the binary with no arguments prints it too, and exits with `2`. |
 
-- `--wait` waits until the started backups finish and prints each result.
+- `--wait` follows the started backups: it prints the service's log lines
+  of these backups as they appear (helper pod, backup command and its
+  stderr, uploaded file, retries, pruned files), then each result. If the
+  backup stays silent for 30s, it prints that it is still running. With
+  several backups (`--all`) every line starts with `[<namespace>/<pod>]`.
   `--timeout` (e.g. `30m`) limits the wait. The backup itself keeps running
   when the wait times out or the CLI is interrupted.
+- Without `--wait`, `run` only starts the backup and returns.
 - Exit codes: `0` success; `1` the request failed, the backup failed
   (`--wait`) or the wait timed out; `2` wrong usage.
 - The CLI talks to the service over HTTP: `--server <url>`, else
@@ -361,6 +368,35 @@ db/postgres-0   running    single  0 */6 * * *  in 2h14m  failed 6h ago  db/post
 
 INVALID (skipped)  ERROR
 db/mongo-0         missing required annotation oap/backup-file-folder
+
+$ oapb status
+Backups:   2 scheduled, 1 invalid, 1 in progress
+Next run:  app/tenants-0 in 2h14m (schedule 0 */6 * * *)
+
+Backup in progress: db/postgres-0
+  State:         running for 31s
+  Trigger:       manual, at 2026-11-24 12:00:00 UTC
+  Mode:          single
+  Container:     postgres
+  Command:       pg_dumpall -U postgres
+  Folder:        db/postgres
+  Compression:   zstd (level 19)
+  Previous run:  ok, 6h0m ago (schedule, started 2026-11-24 06:00:00 UTC, took 41s, uploaded 1 file, 117.7 MiB)
+  Log:
+    12:00:00 INFO  backup triggered trigger=manual
+    12:00:00 INFO  running backup command folder=db/postgres pod=postgres-0 container=postgres command="pg_dumpall -U postgres" dir=db/postgres file=backup-20261124120000.sql.zst
+    12:00:31 INFO  backup command stderr folder=db/postgres pod=postgres-0 line="pg_dumpall: dumping database \"app\""
+
+$ oapb run db/postgres-0 --wait
+started backup of db/postgres-0
+  12:00:00 INFO  backup triggered trigger=manual
+  12:00:00 INFO  running backup command folder=db/postgres pod=postgres-0 container=postgres command="pg_dumpall -U postgres" dir=db/postgres file=backup-20261124120000.sql.zst
+  12:00:31 INFO  backup command stderr folder=db/postgres pod=postgres-0 line="pg_dumpall: dumping database \"app\""
+  12:00:40 INFO  backup file written folder=db/postgres file=backup-20261124120000.sql.zst size_bytes=124151398
+  12:00:42 INFO  backup complete folder=db/postgres file=backup-20261124120000.sql.zst size_bytes=124151398 location=s3://backups/prod/db/postgres/backup-20261124120000.sql.zst duration=42s
+  12:00:42 INFO  pruned file folder=db/postgres file=backup-20261122120000.sql.zst reason=retention_keep_last=8
+  12:00:42 INFO  prune complete folder=db/postgres deleted=1 kept=8
+db/postgres-0: ok in 42s, 1 file, 118.4 MiB uploaded
 
 $ oapb describe db/postgres-0
 Target:       db/postgres-0
@@ -391,10 +427,11 @@ Served on `--metrics_port` (9090):
 |---|---|
 | `GET /metrics` | Prometheus metrics. |
 | `GET /healthz` | Liveness/readiness, returns `ok`. |
-| `GET /targets` | `{"targets": [...], "invalid": [...]}`. `targets`: scheduled pods with parsed annotations, `next_run`, `running`, `last_run`. `invalid`: pods skipped because of their annotations, with the error. |
+| `GET /targets` | `{"targets": [...], "invalid": [...]}`. `targets`: scheduled pods with parsed annotations, `next_run`, `running`, `current_run` (trigger, `triggered`, `started`; while a backup is in progress) and `last_run`. `invalid`: pods skipped because of their annotations, with the error. |
 | `GET /targets/<namespace>/<pod>` | One scheduled pod, as in `/targets`, plus `storage`: its location and the files of the backup folder (or of every part folder). If the storage cannot be read, `storage.error` is set. `404` if the pod is not scheduled. |
 | `POST /run?target=<namespace>/<pod>` | Start a backup of one pod now (replaces the DAG's `force` param). Returns `202 {"started": [...]}`, `404` if the pod is not scheduled, or `409` if its backup is already running. |
 | `POST /run` | Start a backup of **every** scheduled pod that is not running one. |
+| `GET /targets/<namespace>/<pod>/log?after=<cursor>` | Recent log lines of one pod's backups (kept in memory, the newest 2000 per pod, at the service's `--loglevel`): `{"lines": [{seq, time, level, text}], "next": <cursor>}`. Pass `next` as `after` to get only newer lines. `POST /run` returns the cursor of each started backup in `log_after`. |
 | `POST /refresh` | Rescan the pods now and return the same body as `GET /targets`. `503` if the pods could not be listed. |
 
 The [CLI](#cli) is a client of these endpoints. Errors are returned as

@@ -41,6 +41,11 @@ const usage = `Usage:
       Everything about one backup: annotations, schedule, last run and the
       files on the backup storage.
 
+  oap-backup status [--lines 15] [-o table|json]
+      What oap-backup is doing now. For every backup in progress: how long
+      it has been running (or that it is queued), its settings and the last
+      lines of its log.
+
   oap-backup refresh [-o table|json]
       Rescan the pods now, instead of waiting for the next periodic scan
       (--refresh of the service), and list the result. Use it after you
@@ -48,8 +53,8 @@ const usage = `Usage:
 
   oap-backup run <namespace>/<pod> [--wait] [--timeout 30m]
   oap-backup run --all [--wait] [--timeout 30m]
-      Start a backup now. With --wait, wait until it finishes and exit 1 if
-      it failed.
+      Start a backup now. With --wait, print the backup's log while it
+      runs, wait until it finishes and exit 1 if it failed.
 
 Common flags:
   --server URL   address of the oap-backup service
@@ -62,7 +67,7 @@ Without a command, oap-backup runs the service; see oap-backup --help.
 // the service).
 func IsCommand(arg string) bool {
 	switch arg {
-	case "list", "describe", "run", "refresh", "help":
+	case "list", "describe", "run", "refresh", "status", "help":
 		return true
 	}
 	return false
@@ -74,18 +79,22 @@ type App struct {
 	Stdout io.Writer
 	Stderr io.Writer
 	HTTP   *http.Client
-	// Now and PollInterval are replaced in tests.
+	// Now, PollInterval and QuietInterval are replaced in tests.
 	Now          func() time.Time
 	PollInterval time.Duration
+	// QuietInterval is how long run --wait stays silent before it prints
+	// that the backup is still running.
+	QuietInterval time.Duration
 }
 
 // New returns an App that writes to stdout and stderr.
 func New(getenv func(string) string, stdout, stderr io.Writer) *App {
 	return &App{
 		Getenv: getenv, Stdout: stdout, Stderr: stderr,
-		HTTP:         &http.Client{Timeout: 2 * time.Minute},
-		Now:          time.Now,
-		PollInterval: 2 * time.Second,
+		HTTP:          &http.Client{Timeout: 2 * time.Minute},
+		Now:           time.Now,
+		PollInterval:  2 * time.Second,
+		QuietInterval: 30 * time.Second,
 	}
 }
 
@@ -102,6 +111,8 @@ func (a *App) Run(args []string) int {
 		err = a.list("list", http.MethodGet, "/targets", args[1:])
 	case "refresh":
 		err = a.list("refresh", http.MethodPost, "/refresh", args[1:])
+	case "status":
+		err = a.status(args[1:])
 	case "describe":
 		err = a.describe(args[1:])
 	case "run":
@@ -271,7 +282,7 @@ func (a *App) run(args []string) error {
 	}
 
 	// The runs that finished before this one, to tell them from its result.
-	before := map[string]time.Time{}
+	before := map[string]int64{}
 	if wait {
 		var list api.TargetList
 		if err := a.call(o.server, http.MethodGet, "/targets", &list); err != nil {
@@ -279,7 +290,7 @@ func (a *App) run(args []string) error {
 		}
 		for _, t := range list.Targets {
 			if t.LastRun != nil {
-				before[t.Target.Key()] = t.LastRun.Finished
+				before[t.Target.Key()] = t.LastRun.Seq
 			}
 		}
 	}
@@ -296,18 +307,27 @@ func (a *App) run(args []string) error {
 		fmt.Fprintf(a.Stdout, "started backup of %s\n", key)
 	}
 	if !wait {
+		fmt.Fprintln(a.Stdout, "The backup runs in the background. Add --wait to follow its log and get its result,")
+		fmt.Fprintln(a.Stdout, "or check it with: oap-backup status")
 		return nil
 	}
-	return a.wait(o.server, resp.Started, before, timeout)
+	return a.wait(o.server, resp.Started, before, resp.LogAfter, timeout)
 }
 
-// wait polls until every started backup has finished and reports each
-// result. It returns an error if any of them failed.
-func (a *App) wait(server string, started []string, before map[string]time.Time, timeout time.Duration) error {
+// wait polls until every started backup has finished. Meanwhile it prints
+// the log lines the service records for them (cursors holds, per target,
+// the log cursor from before the run), then each result. It returns an
+// error if any backup failed.
+func (a *App) wait(server string, started []string, before map[string]int64, cursors map[string]int64, timeout time.Duration) error {
 	pending := map[string]bool{}
 	for _, key := range started {
 		pending[key] = true
 	}
+	if cursors == nil {
+		cursors = map[string]int64{}
+	}
+	startedAt := a.Now()
+	lastOutput := startedAt
 	deadline := a.Now().Add(timeout)
 	failed := 0
 	for {
@@ -323,6 +343,11 @@ func (a *App) wait(server string, started []string, before map[string]time.Time,
 			if !pending[key] {
 				continue
 			}
+			// The log is read after the status: when the status says
+			// "finished", the log already has the run's last line.
+			if a.printLog(server, key, cursors, len(started) > 1) {
+				lastOutput = a.Now()
+			}
 			st, ok := statuses[key]
 			switch {
 			case !ok:
@@ -330,7 +355,7 @@ func (a *App) wait(server string, started []string, before map[string]time.Time,
 				failed++
 			case st.Running:
 				continue
-			case st.LastRun == nil || st.LastRun.Finished.Equal(before[key]):
+			case st.LastRun == nil || st.LastRun.Seq == before[key]:
 				fmt.Fprintf(a.Stdout, "%s: did not run (oap-backup is shutting down?)\n", key)
 				failed++
 			case st.LastRun.Error != "":
@@ -347,12 +372,38 @@ func (a *App) wait(server string, started []string, before map[string]time.Time,
 		if timeout > 0 && !a.Now().Before(deadline) {
 			return fmt.Errorf("timed out after %s; still running: %s", timeout, strings.Join(sortedKeys(pending), ", "))
 		}
+		// A sign of life while the backup command produces no log lines.
+		if now := a.Now(); now.Sub(lastOutput) >= a.QuietInterval {
+			fmt.Fprintf(a.Stdout, "... still running after %s: %s\n",
+				shortDuration(now.Sub(startedAt)), strings.Join(sortedKeys(pending), ", "))
+			lastOutput = now
+		}
 		time.Sleep(a.PollInterval)
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d of %d backups did not succeed", failed, len(started))
 	}
 	return nil
+}
+
+// printLog prints the lines the service recorded for target since
+// cursors[target], advances the cursor, and reports whether it printed
+// anything. Failing to read the log does not fail the wait.
+func (a *App) printLog(server, target string, cursors map[string]int64, prefix bool) bool {
+	namespace, pod, _ := strings.Cut(target, "/")
+	path := fmt.Sprintf("/targets/%s/%s/log?after=%d", url.PathEscape(namespace), url.PathEscape(pod), cursors[target])
+	var resp api.LogResponse
+	if err := a.call(server, http.MethodGet, path, &resp); err != nil {
+		return false
+	}
+	cursors[target] = resp.Next
+	for _, line := range resp.Lines {
+		if prefix {
+			fmt.Fprintf(a.Stdout, "[%s] ", target)
+		}
+		fmt.Fprintf(a.Stdout, "  %s\n", formatLogLine(line))
+	}
+	return len(resp.Lines) > 0
 }
 
 // call sends a request to the service and decodes a 2xx JSON response into

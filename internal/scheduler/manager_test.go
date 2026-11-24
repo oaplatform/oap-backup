@@ -13,7 +13,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/metrics"
@@ -135,6 +137,24 @@ func TestReconcile(t *testing.T) {
 	next := m.Targets()[0].NextRun
 	if kyiv, _ := time.LoadLocation("Europe/Kyiv"); next.In(kyiv).Hour() != 3 {
 		t.Errorf("next run %s is not 03:00 Kyiv", next)
+	}
+}
+
+func TestReconcileListError(t *testing.T) {
+	client := fake.NewClientset(annotatedPod("db", "a", ""))
+	m := newManager(client, &fakeRunner{})
+	if err := m.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("api down")
+	})
+	if err := m.Reconcile(context.Background()); err == nil || !strings.Contains(err.Error(), "api down") {
+		t.Fatalf("Reconcile err = %v, want api down", err)
+	}
+	// The schedules from the last successful listing are kept.
+	if got := keys(m); len(got) != 1 || got["db/a"] == "" {
+		t.Errorf("targets = %v, want db/a kept", got)
 	}
 }
 

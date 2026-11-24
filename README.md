@@ -326,6 +326,7 @@ alias oapb='kubectl -n oap-backup exec deploy/oap-backup -- /oap-backup'
 
 oapb list                          # backups that oap-backup detected
 oapb describe db/postgres-0        # everything about one backup
+oapb refresh                       # rescan the pods now
 oapb run db/postgres-0 --wait      # back up this pod now
 ```
 
@@ -333,6 +334,7 @@ oapb run db/postgres-0 --wait      # back up this pod now
 |---|---|
 | `list [-o table\|json]` | Every pod with `oap/backup-command`: status (`scheduled` / `running`), mode (`single` / `parts`), schedule, time to the next run, result of the last run, folder. Pods skipped because of invalid annotations are listed below, with the error. |
 | `describe <namespace>/<pod> [-o table\|json]` | The parsed annotations, next run, last run (trigger, start, duration, uploaded files and size, error), and the storage: every file in the backup folder with its backup time and size, newest first. For [partitioned backups](#partitioned-backups): the same for every part folder. Files that the next retention run deletes are marked. |
+| `refresh [-o table\|json]` | Rescan the pods now, without waiting for the next periodic scan (`--refresh`, 60s), and print the same list as `list`. Use it right after you changed a pod's `oap/backup-*` annotations. It fails if the Kubernetes API cannot be reached; the current schedules are then kept. |
 | `run <namespace>/<pod> [--wait] [--timeout <duration>]` | Start a backup of the pod now. It fails if the pod is not scheduled or its backup is already running. |
 | `run --all [--wait] [--timeout <duration>]` | Start a backup of every scheduled pod that is not running one. |
 | `help`, `-h`, `--help` | Print the help: the commands, and how to start the service with all its flags. Running the binary with no arguments prints it too, and exits with `2`. |
@@ -393,6 +395,7 @@ Served on `--metrics_port` (9090):
 | `GET /targets/<namespace>/<pod>` | One scheduled pod, as in `/targets`, plus `storage`: its location and the files of the backup folder (or of every part folder). If the storage cannot be read, `storage.error` is set. `404` if the pod is not scheduled. |
 | `POST /run?target=<namespace>/<pod>` | Start a backup of one pod now (replaces the DAG's `force` param). Returns `202 {"started": [...]}`, `404` if the pod is not scheduled, or `409` if its backup is already running. |
 | `POST /run` | Start a backup of **every** scheduled pod that is not running one. |
+| `POST /refresh` | Rescan the pods now and return the same body as `GET /targets`. `503` if the pods could not be listed. |
 
 The [CLI](#cli) is a client of these endpoints. Errors are returned as
 `{"error": "..."}`.

@@ -16,7 +16,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/api"
@@ -80,6 +82,7 @@ func pod(name string, extra map[string]string) *corev1.Pod {
 }
 
 type env struct {
+	client    *fake.Clientset
 	server    *httptest.Server
 	job       *fakeJob
 	inspector *fakeInspector
@@ -137,7 +140,7 @@ func newEnv(t *testing.T) *env {
 		Logger:          logger,
 	}).Handler())
 	t.Cleanup(srv.Close)
-	return &env{server: srv, job: job, inspector: inspector}
+	return &env{client: client, server: srv, job: job, inspector: inspector}
 }
 
 // run executes the CLI against the test service and returns its exit code,
@@ -185,6 +188,53 @@ func TestList(t *testing.T) {
 	}
 	if len(list.Targets) != 2 || len(list.Invalid) != 1 || list.Targets[0].Target.Key() != "db/parts-0" || !list.Targets[0].Target.Parts {
 		t.Errorf("list = %+v", list)
+	}
+}
+
+func TestRefresh(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	// A new annotated pod, a fixed one and a deleted one; the service has
+	// not rescanned yet.
+	if _, err := e.client.CoreV1().Pods("db").Create(ctx, pod("mongo-0", nil), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.client.CoreV1().Pods("db").Update(ctx, pod("broken", nil), metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.client.CoreV1().Pods("db").Delete(ctx, "parts-0", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ := e.run("list")
+	if strings.Contains(out, "db/mongo-0") || !strings.Contains(out, "db/parts-0") || !strings.Contains(out, "INVALID") {
+		t.Fatalf("list before refresh:\n%s", out)
+	}
+
+	code, out, stderr := e.run("refresh")
+	if code != cli.ExitOK {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+	wantContains(t, out, "db/mongo-0", "db/broken", "db/pg-0")
+	if strings.Contains(out, "db/parts-0") || strings.Contains(out, "INVALID") {
+		t.Errorf("refresh output still has the deleted or the fixed pod:\n%s", out)
+	}
+	// The rescan is persistent, not just a view.
+	_, out, _ = e.run("list")
+	wantContains(t, out, "db/mongo-0")
+
+	code, out, _ = e.run("refresh", "-o", "json")
+	var list api.TargetList
+	if err := json.Unmarshal([]byte(out), &list); code != cli.ExitOK || err != nil || len(list.Targets) != 3 {
+		t.Fatalf("exit %d, json error %v:\n%s", code, err, out)
+	}
+
+	// The Kubernetes API fails: refresh fails and says why.
+	e.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("api down")
+	})
+	code, _, stderr = e.run("refresh")
+	if code != cli.ExitFailed || !strings.Contains(stderr, "pods were not rescanned") || !strings.Contains(stderr, "api down") {
+		t.Errorf("failed refresh: exit %d, stderr %q", code, stderr)
 	}
 }
 
@@ -333,6 +383,7 @@ func TestUsageErrors(t *testing.T) {
 		{"list", "extra"},
 		{"list", "-o", "xml"},
 		{"list", "--nope"},
+		{"refresh", "now"},
 		{"describe"},
 		{"describe", "pg-0"},
 		{"describe", "db/pg-0", "db/parts-0"},
@@ -383,7 +434,7 @@ func TestServerFlagAndUnreachable(t *testing.T) {
 }
 
 func TestIsCommand(t *testing.T) {
-	for _, c := range []string{"list", "describe", "run", "help"} {
+	for _, c := range []string{"list", "describe", "run", "refresh", "help"} {
 		if !cli.IsCommand(c) {
 			t.Errorf("IsCommand(%q) = false", c)
 		}

@@ -41,6 +41,11 @@ const usage = `Usage:
       Everything about one backup: annotations, schedule, last run and the
       files on the backup storage.
 
+  oap-backup refresh [-o table|json]
+      Rescan the pods now, instead of waiting for the next periodic scan
+      (--refresh of the service), and list the result. Use it after you
+      changed a pod's oap/backup-* annotations.
+
   oap-backup run <namespace>/<pod> [--wait] [--timeout 30m]
   oap-backup run --all [--wait] [--timeout 30m]
       Start a backup now. With --wait, wait until it finishes and exit 1 if
@@ -57,7 +62,7 @@ Without a command, oap-backup runs the service; see oap-backup --help.
 // the service).
 func IsCommand(arg string) bool {
 	switch arg {
-	case "list", "describe", "run", "help":
+	case "list", "describe", "run", "refresh", "help":
 		return true
 	}
 	return false
@@ -94,7 +99,9 @@ func (a *App) Run(args []string) int {
 	var err error
 	switch args[0] {
 	case "list":
-		err = a.list(args[1:])
+		err = a.list("list", http.MethodGet, "/targets", args[1:])
+	case "refresh":
+		err = a.list("refresh", http.MethodPost, "/refresh", args[1:])
 	case "describe":
 		err = a.describe(args[1:])
 	case "run":
@@ -182,20 +189,22 @@ func targetKey(arg string) (namespace, pod string, err error) {
 	return namespace, pod, nil
 }
 
-func (a *App) list(args []string) error {
+// list implements the commands that print the targets: "list", and
+// "refresh", which makes the service rescan the pods first.
+func (a *App) list(name, method, path string, args []string) error {
 	var o options
-	positional, err := parse(a.flagSet("list", &o, true), args)
+	positional, err := parse(a.flagSet(name, &o, true), args)
 	if err != nil {
 		return err
 	}
 	if len(positional) > 0 {
-		return usageError{"list takes no arguments"}
+		return usageError{name + " takes no arguments"}
 	}
 	if err := checkOutput(o); err != nil {
 		return err
 	}
 	var list api.TargetList
-	if err := a.call(o.server, http.MethodGet, "/targets", &list); err != nil {
+	if err := a.call(o.server, method, path, &list); err != nil {
 		return err
 	}
 	if o.output == "json" {

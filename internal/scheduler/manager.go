@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
@@ -131,7 +132,7 @@ func (m *Manager) init() {
 func (m *Manager) Run(ctx context.Context) {
 	m.init()
 	m.cron.Start()
-	m.Reconcile(ctx)
+	_ = m.Reconcile(ctx) // logged; retried on the next tick
 
 	ticker := time.NewTicker(m.Refresh)
 	defer ticker.Stop()
@@ -141,7 +142,7 @@ func (m *Manager) Run(ctx context.Context) {
 			m.shutdown()
 			return
 		case <-ticker.C:
-			m.Reconcile(ctx)
+			_ = m.Reconcile(ctx)
 		}
 	}
 }
@@ -170,21 +171,22 @@ func (m *Manager) shutdown() {
 // Reconcile lists pods and brings cron entries in line with their
 // annotations: new targets are added, changed ones replaced, and targets of
 // pods that are gone (or no longer valid) removed. If listing fails, the
-// current entries are kept.
-func (m *Manager) Reconcile(ctx context.Context) {
+// current entries are kept and the error is returned (it is also logged).
+// It is safe to call at any time, also while Run is reconciling.
+func (m *Manager) Reconcile(ctx context.Context) error {
 	m.init()
 	list, err := m.Client.CoreV1().Pods(m.Namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		if ctx.Err() == nil {
 			m.Logger.Error("listing pods failed, keeping current schedules", "error", err)
 		}
-		return
+		return fmt.Errorf("listing pods: %w", err)
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return
+		return errors.New("oap-backup is shutting down")
 	}
 
 	seen := map[string]bool{}
@@ -251,6 +253,7 @@ func (m *Manager) Reconcile(ctx context.Context) {
 		m.Metrics.Targets.Set(float64(len(m.entries)))
 		m.Metrics.InvalidTargets.Set(float64(invalid))
 	}
+	return nil
 }
 
 func (m *Manager) runScheduled(key string) {

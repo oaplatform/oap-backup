@@ -57,6 +57,7 @@ type Scheduler interface {
 	Invalid() []scheduler.InvalidTarget
 	Target(key string) (scheduler.TargetStatus, bool)
 	Trigger(target string) ([]string, error)
+	Reconcile(ctx context.Context) error
 }
 
 // Inspector reads a target's files from the storage (backup.Runner).
@@ -72,7 +73,8 @@ type Server struct {
 	Inspector Inspector
 	// StorageLocation describes the storage root, for display.
 	StorageLocation string
-	// InspectTimeout bounds reading the storage for one request.
+	// InspectTimeout bounds reading the storage, or re-listing the pods,
+	// for one request.
 	InspectTimeout time.Duration
 	Logger         *slog.Logger
 }
@@ -87,11 +89,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /targets", s.listTargets)
 	mux.HandleFunc("GET /targets/{namespace}/{pod}", s.describeTarget)
 	mux.HandleFunc("POST /run", s.run)
+	mux.HandleFunc("POST /refresh", s.refresh)
 	return mux
 }
 
 func (s *Server) listTargets(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, TargetList{Targets: s.Scheduler.Targets(), Invalid: s.Scheduler.Invalid()})
+}
+
+// refresh re-lists the pods now instead of waiting for the next periodic
+// reconcile, and returns the resulting targets.
+func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.InspectTimeout)
+	defer cancel()
+	if err := s.Scheduler.Reconcile(ctx); err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("pods were not rescanned: %v", err))
+		return
+	}
+	s.Logger.Info("manual refresh requested")
+	s.listTargets(w, r)
 }
 
 func (s *Server) describeTarget(w http.ResponseWriter, r *http.Request) {

@@ -19,9 +19,42 @@ import (
 	"oap-backup/internal/metrics"
 )
 
-// JobRunner runs one complete backup of a target (implemented by backup.Runner).
+// JobRunner runs one complete backup of a target (backup.Runner, adapted in
+// main) and reports what it uploaded.
 type JobRunner interface {
-	Run(ctx context.Context, t annotations.Target) error
+	Run(ctx context.Context, t annotations.Target) (RunResult, error)
+}
+
+// RunResult is what one backup run uploaded.
+type RunResult struct {
+	Files     int
+	SizeBytes int64
+}
+
+// Triggers of a backup run.
+const (
+	TriggerSchedule = "schedule"
+	TriggerManual   = "manual"
+)
+
+// LastRun describes the most recent finished run of a target since
+// oap-backup started.
+type LastRun struct {
+	// Trigger is TriggerSchedule or TriggerManual.
+	Trigger  string    `json:"trigger"`
+	Started  time.Time `json:"started"`
+	Finished time.Time `json:"finished"`
+	// Error is empty for a successful run.
+	Error string `json:"error,omitempty"`
+	// Files and SizeBytes describe what the run uploaded.
+	Files     int   `json:"files"`
+	SizeBytes int64 `json:"size_bytes"`
+}
+
+// InvalidTarget is an opted-in pod that is skipped because of its annotations.
+type InvalidTarget struct {
+	Key   string `json:"key"`
+	Error string `json:"error"`
 }
 
 // ErrUnknownTarget is returned by Trigger for a target that is not scheduled.
@@ -48,6 +81,7 @@ type Manager struct {
 	entries map[string]*entry
 	running map[string]bool
 	warned  map[string]string
+	lastRun map[string]*LastRun
 	closed  bool
 	sem     chan struct{}
 	wg      sync.WaitGroup
@@ -66,6 +100,8 @@ type TargetStatus struct {
 	Target  annotations.Target `json:"target"`
 	NextRun time.Time          `json:"next_run"`
 	Running bool               `json:"running"`
+	// LastRun is nil until a run of the target has finished.
+	LastRun *LastRun `json:"last_run,omitempty"`
 }
 
 func (m *Manager) init() {
@@ -79,6 +115,7 @@ func (m *Manager) init() {
 		m.entries = map[string]*entry{}
 		m.running = map[string]bool{}
 		m.warned = map[string]string{}
+		m.lastRun = map[string]*LastRun{}
 		n := m.MaxConcurrent
 		if n <= 0 {
 			n = 1
@@ -204,6 +241,7 @@ func (m *Manager) Reconcile(ctx context.Context) {
 		if !seen[key] {
 			m.cron.Remove(e.id)
 			delete(m.entries, key)
+			delete(m.lastRun, key)
 			m.Logger.Info("backup unscheduled (pod gone or annotations removed/invalid)", "target", key)
 		}
 	}
@@ -216,8 +254,8 @@ func (m *Manager) Reconcile(ctx context.Context) {
 }
 
 func (m *Manager) runScheduled(key string) {
-	if t, ok := m.start(key, "schedule"); ok {
-		m.run(t)
+	if t, ok := m.start(key, TriggerSchedule); ok {
+		m.run(t, TriggerSchedule)
 	}
 }
 
@@ -244,9 +282,9 @@ func (m *Manager) Trigger(target string) ([]string, error) {
 
 	var started []string
 	for _, k := range keys {
-		if t, ok := m.start(k, "manual"); ok {
+		if t, ok := m.start(k, TriggerManual); ok {
 			started = append(started, k)
-			go m.run(t)
+			go m.run(t, TriggerManual)
 		}
 	}
 	return started, nil
@@ -271,11 +309,19 @@ func (m *Manager) start(key, reason string) (annotations.Target, bool) {
 	return e.target, true
 }
 
-func (m *Manager) run(t annotations.Target) {
+// run executes one backup of t and records it as the target's last run. The
+// record and the end of the "running" state become visible together, so a
+// client that polls a target never sees a finished run without its result.
+func (m *Manager) run(t annotations.Target, trigger string) {
 	defer m.wg.Done()
+	var last *LastRun
 	defer func() {
 		m.mu.Lock()
 		delete(m.running, t.Key())
+		// The target may have been unscheduled while the backup ran.
+		if _, ok := m.entries[t.Key()]; ok && last != nil {
+			m.lastRun[t.Key()] = last
+		}
 		m.mu.Unlock()
 	}()
 
@@ -286,7 +332,12 @@ func (m *Manager) run(t annotations.Target) {
 	}
 	defer func() { <-m.sem }()
 
-	_ = m.Runner.Run(m.jobCtx, t) // the runner logs and records the outcome
+	started := time.Now()
+	res, err := m.Runner.Run(m.jobCtx, t) // the runner logs the outcome
+	last = &LastRun{Trigger: trigger, Started: started, Finished: time.Now(), Files: res.Files, SizeBytes: res.SizeBytes}
+	if err != nil {
+		last.Error = err.Error()
+	}
 }
 
 // Targets returns a snapshot of all scheduled targets, sorted by key.
@@ -297,8 +348,44 @@ func (m *Manager) Targets() []TargetStatus {
 	now := time.Now().In(m.Location)
 	out := make([]TargetStatus, 0, len(m.entries))
 	for k, e := range m.entries {
-		out = append(out, TargetStatus{Target: e.target, NextRun: e.schedule.Next(now), Running: m.running[k]})
+		out = append(out, m.status(k, e, now))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Target.Key() < out[j].Target.Key() })
+	return out
+}
+
+// Target returns a snapshot of the scheduled target key ("<namespace>/<pod>").
+func (m *Manager) Target(key string) (TargetStatus, bool) {
+	m.init()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.entries[key]
+	if !ok {
+		return TargetStatus{}, false
+	}
+	return m.status(key, e, time.Now().In(m.Location)), true
+}
+
+// status builds the snapshot of one entry; m.mu must be held.
+func (m *Manager) status(key string, e *entry, now time.Time) TargetStatus {
+	st := TargetStatus{Target: e.target, NextRun: e.schedule.Next(now), Running: m.running[key]}
+	if last := m.lastRun[key]; last != nil {
+		copied := *last
+		st.LastRun = &copied
+	}
+	return st
+}
+
+// Invalid returns the opted-in pods that are skipped because their
+// annotations are invalid, as of the last reconcile, sorted by key.
+func (m *Manager) Invalid() []InvalidTarget {
+	m.init()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]InvalidTarget, 0, len(m.warned))
+	for key, msg := range m.warned {
+		out = append(out, InvalidTarget{Key: key, Error: msg})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
 }

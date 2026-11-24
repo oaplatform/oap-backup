@@ -2,11 +2,13 @@
 // annotations: on each pod's own cron schedule it execs the annotated
 // command in the pod (or in a helper pod), uploads the output to FTP or S3,
 // and prunes old backups.
+//
+// With a subcommand (list, describe, run) it is instead a client of a running
+// oap-backup service; see internal/cli.
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,7 +26,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	"oap-backup/internal/annotations"
+	"oap-backup/internal/api"
 	"oap-backup/internal/backup"
+	"oap-backup/internal/cli"
 	"oap-backup/internal/config"
 	"oap-backup/internal/kube"
 	"oap-backup/internal/metrics"
@@ -33,6 +38,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && cli.IsCommand(os.Args[1]) {
+		os.Exit(cli.New(os.Getenv, os.Stdout, os.Stderr).Run(os.Args[1:]))
+	}
+	serve()
+}
+
+// serve runs the oap-backup service until it is signalled to stop.
+func serve() {
 	cfg, err := config.Load(os.Args[1:], os.Getenv)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "oap-backup:", err)
@@ -86,7 +99,7 @@ func main() {
 		Refresh:         cfg.Refresh,
 		MaxConcurrent:   cfg.MaxConcurrent,
 		ShutdownTimeout: cfg.ShutdownTimeout,
-		Runner:          runner,
+		Runner:          jobRunner{runner},
 		Metrics:         m,
 		Logger:          logger,
 	}
@@ -117,8 +130,15 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.MetricsPort),
-		Handler:           newMux(m, mgr, logger),
+		Addr: fmt.Sprintf(":%d", cfg.MetricsPort),
+		Handler: (&api.Server{
+			Metrics:         promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}),
+			Scheduler:       mgr,
+			Inspector:       runner,
+			StorageLocation: storageDescription(cfg),
+			InspectTimeout:  time.Minute,
+			Logger:          logger,
+		}).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -149,37 +169,12 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func newMux(m *metrics.Metrics, mgr *scheduler.Manager, logger *slog.Logger) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("GET /targets", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.Targets())
-	})
-	mux.HandleFunc("POST /run", func(w http.ResponseWriter, r *http.Request) {
-		target := r.URL.Query().Get("target")
-		started, err := mgr.Trigger(target)
-		if errors.Is(err, scheduler.ErrUnknownTarget) {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("%v: %q", err, target)})
-			return
-		}
-		if started == nil {
-			started = []string{}
-		}
-		logger.Info("manual backup requested", "target", orAll(target), "started", strings.Join(started, ","))
-		writeJSON(w, http.StatusAccepted, map[string][]string{"started": started})
-	})
-	return mux
-}
+// jobRunner adapts backup.Runner to scheduler.JobRunner.
+type jobRunner struct{ runner *backup.Runner }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
+func (j jobRunner) Run(ctx context.Context, t annotations.Target) (scheduler.RunResult, error) {
+	res, err := j.runner.Run(ctx, t)
+	return scheduler.RunResult{Files: res.Files, SizeBytes: res.SizeBytes}, err
 }
 
 // kubeConfig uses the in-cluster service account, falling back to the

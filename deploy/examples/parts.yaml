@@ -1,0 +1,70 @@
+# Partitioned backup: every directory /srv/data/<part> is one part and is
+# backed up only when it changed since its last backup.
+#
+# Storage layout: app/tenants/<part>/backup-<YYYYMMDDHHMMSS>.tar.gz, where the
+# timestamp is the part's modification time reported by the parts command.
+# Partitioned backups always run in a helper pod (image alpine:3.22), which
+# mounts the same volumes at the same paths.
+#
+# oap/backup-parts-command gets the parts already on the storage in
+# PART_COUNT, PART<X>_ID and PART<X>_MT (timestamp of the newest backup) and
+# prints one line per existing part:
+#   <part>=<YYYYMMDDHHMMSS>   new or modified: back it up
+#   <part>=SKIP               not modified
+# Here a part's modification time is that of its newest file.
+#
+# oap/backup-command runs once per printed timestamp, with {PART_ID} replaced
+# by the part id. Schedule: every 6 hours; keep 5 backups per part.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tenants
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tenants
+  template:
+    metadata:
+      labels:
+        app: tenants
+      annotations:
+        oap/backup-parts: "true"
+        oap/backup-parts-command: |
+          cd /srv/data || exit 1
+          for dir in */; do
+            [ -d "$dir" ] || continue
+            id=${dir%/}
+            newest=$(find "$dir" -type f -exec stat -c %Y {} + | sort -n | tail -n 1)
+            mt=$(date -u -d "@${newest:-0}" +%Y%m%d%H%M%S)
+            last=
+            i=0
+            while [ "$i" -lt "$PART_COUNT" ]; do
+              eval "part_id=\$PART${i}_ID part_mt=\$PART${i}_MT"
+              if [ "$part_id" = "$id" ]; then last=$part_mt; fi
+              i=$((i + 1))
+            done
+            if [ -n "$last" ] && [ "$mt" -le "$last" ]; then
+              echo "$id=SKIP"
+            else
+              echo "$id=$mt"
+            fi
+          done
+        oap/backup-command: "tar -czf - -C /srv/data/{PART_ID} ."
+        oap/backup-schedule: "0 */6 * * *"
+        oap/backup-file-folder: "app/tenants"
+        oap/backup-file-extension: ".tar.gz"
+        oap/backup-retention-keep-last: "5"
+        oap/backup-external-container-image: "alpine:3.22"
+    spec:
+      containers:
+        - name: tenants
+          image: example/tenants:1.0
+          volumeMounts:
+            - name: data
+              mountPath: /srv/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tenants-data

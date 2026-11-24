@@ -90,6 +90,67 @@ func (f *FTP) Delete(ctx context.Context, dir, name string) error {
 	})
 }
 
+// ListDirs implements Storage.
+func (f *FTP) ListDirs(ctx context.Context, dir string) ([]string, error) {
+	entries, err := f.entries(ctx, dir)
+	var names []string
+	for _, e := range entries {
+		if e.Type == ftp.EntryTypeFolder {
+			names = append(names, e.Name)
+		}
+	}
+	return names, err
+}
+
+// ListFiles implements Storage.
+func (f *FTP) ListFiles(ctx context.Context, dir string) ([]File, error) {
+	entries, err := f.entries(ctx, dir)
+	var files []File
+	for _, e := range entries {
+		if e.Type == ftp.EntryTypeFile {
+			files = append(files, File{Name: e.Name, Size: int64(e.Size), ModTime: e.Time})
+		}
+	}
+	return files, err
+}
+
+// entries returns the detailed listing (LIST/MLSD) of <ftp_folder>/<dir>
+// without "." and "..". As in List, a missing or unreadable directory is
+// empty.
+func (f *FTP) entries(ctx context.Context, dir string) ([]*ftp.Entry, error) {
+	remoteDir := f.remoteDir(dir)
+	var out []*ftp.Entry
+	err := f.with(ctx, func(c *ftp.ServerConn) error {
+		entries, err := c.List(remoteDir)
+		if err != nil {
+			var protoErr *textproto.Error
+			if errors.As(err, &protoErr) {
+				return nil
+			}
+			return fmt.Errorf("ftp LIST %s: %w", remoteDir, err)
+		}
+		for _, e := range entries {
+			if e.Name == "." || e.Name == ".." {
+				continue
+			}
+			out = append(out, e)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// RemoveDir implements Storage.
+func (f *FTP) RemoveDir(ctx context.Context, dir string) error {
+	remoteDir := f.remoteDir(dir)
+	return f.with(ctx, func(c *ftp.ServerConn) error {
+		if err := c.RemoveDir(remoteDir); err != nil {
+			return fmt.Errorf("ftp RMD %s: %w", remoteDir, err)
+		}
+		return nil
+	})
+}
+
 // basenames strips directory parts (servers differ on full paths vs bare
 // names in NLST output) and drops "." / ".." entries.
 func basenames(entries []string) []string {

@@ -10,12 +10,17 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+	corev1 "k8s.io/api/core/v1"
+
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/kube"
+	"oap-backup/internal/storage"
 )
 
 type execCall struct{ ns, pod, container string }
@@ -26,6 +31,10 @@ type fakeExec struct {
 	stdout string
 	// errs are returned by successive calls; nil once exhausted.
 	errs []error
+	// cmds records the shell command of every call.
+	cmds []string
+	// handler, when set, replaces the stdout/errs behaviour.
+	handler func(cmd string, stdout io.Writer) error
 }
 
 func (f *fakeExec) Exec(_ context.Context, ns, pod, container string, cmd []string, stdout, stderr io.Writer) error {
@@ -35,8 +44,12 @@ func (f *fakeExec) Exec(_ context.Context, ns, pod, container string, cmd []stri
 	if len(cmd) != 3 || cmd[0] != "sh" || cmd[1] != "-c" {
 		return errors.New("unexpected command")
 	}
-	_, _ = io.WriteString(stdout, f.stdout)
+	f.cmds = append(f.cmds, cmd[2])
 	_, _ = io.WriteString(stderr, "progress 1\nprogress 2")
+	if f.handler != nil {
+		return f.handler(cmd[2], stdout)
+	}
+	_, _ = io.WriteString(stdout, f.stdout)
 	if len(f.errs) > 0 {
 		err := f.errs[0]
 		f.errs = f.errs[1:]
@@ -79,6 +92,16 @@ func (m *memStorage) List(_ context.Context, dir string) ([]string, error) {
 	return out, nil
 }
 
+func (m *memStorage) ListFiles(_ context.Context, dir string) ([]storage.File, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []storage.File
+	for n, data := range m.files[dir] {
+		out = append(out, storage.File{Name: n, Size: int64(len(data))})
+	}
+	return out, nil
+}
+
 func (m *memStorage) Delete(_ context.Context, dir, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -89,17 +112,46 @@ func (m *memStorage) Delete(_ context.Context, dir, name string) error {
 	return nil
 }
 
+// ListDirs returns the folders directly inside dir, including empty ones
+// (as on FTP) until RemoveDir removes them.
+func (m *memStorage) ListDirs(_ context.Context, dir string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for d := range m.files {
+		if name, ok := strings.CutPrefix(d, dir+"/"); ok && !strings.Contains(name, "/") {
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStorage) RemoveDir(_ context.Context, dir string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.files[dir]) > 0 {
+		return errors.New("directory not empty")
+	}
+	delete(m.files, dir)
+	return nil
+}
+
 func (m *memStorage) names(dir string) []string {
 	n, _ := m.List(context.Background(), dir)
 	sort.Strings(n)
 	return n
 }
 
-type fakeHelpers struct{ created, deleted []string }
+type fakeHelpers struct {
+	created, deleted []string
+	// envs records the env of every created helper pod.
+	envs [][]corev1.EnvVar
+}
 
-func (h *fakeHelpers) Create(_ context.Context, ns, pod, container, image string) (string, error) {
+func (h *fakeHelpers) Create(_ context.Context, ns, pod, container, image string, env []corev1.EnvVar) (string, error) {
 	name := kube.HelperPodName(pod)
 	h.created = append(h.created, ns+"/"+name+"@"+image)
+	h.envs = append(h.envs, env)
 	return name, nil
 }
 
@@ -129,7 +181,7 @@ var now = time.Date(2026, 11, 10, 1, 30, 0, 0, time.UTC)
 
 func TestRunGzipsAndUploads(t *testing.T) {
 	ex, st, h := &fakeExec{stdout: "dump-data"}, newMem(), &fakeHelpers{}
-	if err := newRunner(ex, st, h, now).Run(context.Background(), target(".sql")); err != nil {
+	if _, err := newRunner(ex, st, h, now).Run(context.Background(), target(".sql")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	data := st.files["postgres"]["backup-20261110013000.sql.gz"]
@@ -151,7 +203,7 @@ func TestRunGzipsAndUploads(t *testing.T) {
 
 func TestRunAlreadyGzipped(t *testing.T) {
 	ex, st := &fakeExec{stdout: "raw-gz-bytes"}, newMem()
-	if err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".archive.gz")); err != nil {
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".archive.gz")); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := string(st.files["postgres"]["backup-20261110013000.archive.gz"]); got != "raw-gz-bytes" {
@@ -164,7 +216,7 @@ func TestRunHelperPodAndRetries(t *testing.T) {
 	st, h := newMem(), &fakeHelpers{}
 	tg := target(".sql")
 	tg.ExternalImage = "postgres:17"
-	if err := newRunner(ex, st, h, now).Run(context.Background(), tg); err != nil {
+	if _, err := newRunner(ex, st, h, now).Run(context.Background(), tg); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(ex.calls) != 3 {
@@ -192,7 +244,7 @@ func TestRunFailsAfterRetriesButStillPrunes(t *testing.T) {
 		"backup-20261102000000.sql.gz": nil,
 		"backup-20261103000000.sql.gz": nil,
 	}
-	err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".sql"))
+	_, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".sql"))
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -268,5 +320,73 @@ func TestLineLogger(t *testing.T) {
 	}
 	if bytes.Count([]byte(out), []byte("backup command stderr")) != 3 {
 		t.Errorf("want 3 lines, got:\n%s", out)
+	}
+}
+
+func TestRunZstd(t *testing.T) {
+	ex, st := &fakeExec{stdout: strings.Repeat("dump-data ", 1000)}, newMem()
+	// An older gzip backup: after switching the codec it is still a backup,
+	// so retention counts it instead of deleting it as a foreign file.
+	st.files["postgres"] = map[string][]byte{
+		"backup-20261101000000.sql.gz": nil,
+		"backup-20261102000000.sql.gz": nil,
+	}
+	tg := target(".sql")
+	tg.Compression = annotations.Zstd
+	tg.CompressionLevel = 19
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{"backup-20261102000000.sql.gz", "backup-20261110013000.sql.zst"}
+	if got := st.names("postgres"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("files = %v, want %v", got, want)
+	}
+	data := st.files["postgres"]["backup-20261110013000.sql.zst"]
+	zr, err := zstd.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("zstd reader: %v", err)
+	}
+	defer zr.Close()
+	plain, err := io.ReadAll(zr)
+	if err != nil || string(plain) != ex.stdout {
+		t.Errorf("content: %d bytes, err %v; want the %d-byte dump", len(plain), err, len(ex.stdout))
+	}
+	if len(data) >= len(ex.stdout) {
+		t.Errorf("stored %d bytes, want less than the %d-byte dump", len(data), len(ex.stdout))
+	}
+}
+
+func TestRunGzipLevel(t *testing.T) {
+	dump := strings.Repeat("dump-data ", 1000)
+	sizes := map[int]int{}
+	for _, level := range []int{1, 9} {
+		ex, st := &fakeExec{stdout: dump}, newMem()
+		tg := target(".sql")
+		tg.CompressionLevel = level
+		if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg); err != nil {
+			t.Fatalf("level %d: Run: %v", level, err)
+		}
+		data := st.files["postgres"]["backup-20261110013000.sql.gz"]
+		zr, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("level %d: not gzip: %v", level, err)
+		}
+		if plain, _ := io.ReadAll(zr); string(plain) != dump {
+			t.Errorf("level %d: content differs", level)
+		}
+		sizes[level] = len(data)
+	}
+	if sizes[9] > sizes[1] {
+		t.Errorf("sizes = %v, want level 9 not larger than level 1", sizes)
+	}
+}
+
+func TestRunPrecompressedZstd(t *testing.T) {
+	ex, st := &fakeExec{stdout: "raw-zst-bytes"}, newMem()
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".tar.zst")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := string(st.files["postgres"]["backup-20261110013000.tar.zst"]); got != "raw-zst-bytes" {
+		t.Errorf("content = %q, want stored as-is", got)
 	}
 }

@@ -6,10 +6,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
-// Result label values of oap_backup_runs_total.
+// Result label values of oap_backup_runs_total and
+// oap_backup_part_backups_total.
 const (
 	ResultSuccess = "success"
 	ResultFailure = "failure"
+)
+
+// State label values of oap_backup_parts.
+const (
+	PartChanged   = "changed"
+	PartUnchanged = "unchanged"
+	PartGone      = "gone"
 )
 
 // Metrics groups every oap-backup collector. Per-backup series are labelled
@@ -26,6 +34,13 @@ type Metrics struct {
 	PruneFailures  *prometheus.CounterVec
 	Targets        prometheus.Gauge
 	InvalidTargets prometheus.Gauge
+
+	// Partitioned backups. Series are per target, not per part: a part id
+	// label would create one series per part and target.
+	Parts             *prometheus.GaugeVec
+	PartBackups       *prometheus.CounterVec
+	PartsStored       *prometheus.GaugeVec
+	PartFoldersPruned *prometheus.CounterVec
 }
 
 // New creates the collectors and registers them, plus the Go and process
@@ -66,10 +81,27 @@ func New() *Metrics {
 			Name: "oap_backup_invalid_targets",
 			Help: "Pods with oap/backup-command whose annotations are invalid (skipped).",
 		}),
+		Parts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "oap_backup_parts",
+			Help: "Parts of a partitioned backup by state, as of the last parts listing: changed (to back up), unchanged (SKIP) or gone (stored but no longer listed).",
+		}, append(labels, "state")),
+		PartBackups: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "oap_backup_part_backups_total",
+			Help: "Backups of single parts of a partitioned backup by result, counting every attempt.",
+		}, append(labels, "result")),
+		PartsStored: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "oap_backup_parts_stored",
+			Help: "Part folders of a partitioned backup on the storage after the last retention pruning.",
+		}, labels),
+		PartFoldersPruned: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "oap_backup_part_folders_pruned_total",
+			Help: "Empty part folders removed from the storage by retention pruning.",
+		}, labels),
 	}
 	m.Registry.MustRegister(
 		m.Runs, m.LastSuccess, m.LastSize, m.LastDuration, m.PrunedFiles, m.PruneFailures,
 		m.Targets, m.InvalidTargets,
+		m.Parts, m.PartBackups, m.PartsStored, m.PartFoldersPruned,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

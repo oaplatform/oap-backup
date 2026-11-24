@@ -60,8 +60,21 @@ func (s *S3) Upload(ctx context.Context, dir, name, localPath string) (string, e
 
 // List implements Storage.
 func (s *S3) List(ctx context.Context, dir string) ([]string, error) {
-	prefix := s.key(dir, "") + "/"
+	files, err := s.ListFiles(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
 	var names []string
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	return names, nil
+}
+
+// ListFiles implements Storage.
+func (s *S3) ListFiles(ctx context.Context, dir string) ([]File, error) {
+	prefix := s.key(dir, "") + "/"
+	var files []File
 	for obj := range s.client.ListObjects(ctx, s.cfg.Bucket, minio.ListObjectsOptions{Prefix: prefix}) {
 		if obj.Err != nil {
 			return nil, fmt.Errorf("s3 list s3://%s/%s: %w", s.cfg.Bucket, prefix, obj.Err)
@@ -71,14 +84,44 @@ func (s *S3) List(ctx context.Context, dir string) ([]string, error) {
 		if name == "" || strings.Contains(name, "/") {
 			continue
 		}
-		names = append(names, name)
+		files = append(files, File{Name: name, Size: obj.Size, ModTime: obj.LastModified})
 	}
-	return names, nil
+	return files, nil
 }
 
 // Delete implements Storage.
 func (s *S3) Delete(ctx context.Context, dir, name string) error {
 	key := s.key(dir, name)
+	if err := s.client.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf("s3 delete s3://%s/%s: %w", s.cfg.Bucket, key, err)
+	}
+	return nil
+}
+
+// ListDirs implements Storage. Folders are the common prefixes of a
+// non-recursive listing.
+func (s *S3) ListDirs(ctx context.Context, dir string) ([]string, error) {
+	prefix := s.key(dir, "") + "/"
+	var names []string
+	for obj := range s.client.ListObjects(ctx, s.cfg.Bucket, minio.ListObjectsOptions{Prefix: prefix}) {
+		if obj.Err != nil {
+			return nil, fmt.Errorf("s3 list s3://%s/%s: %w", s.cfg.Bucket, prefix, obj.Err)
+		}
+		name, isDir := strings.CutSuffix(strings.TrimPrefix(obj.Key, prefix), "/")
+		if !isDir || name == "" || strings.Contains(name, "/") {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// RemoveDir implements Storage. Object storage has no folders: a prefix
+// disappears with its last object. Only a "<dir>/" placeholder object, as
+// created by some S3 consoles, needs removing; deleting a missing key is not
+// an error.
+func (s *S3) RemoveDir(ctx context.Context, dir string) error {
+	key := s.key(dir, "") + "/"
 	if err := s.client.RemoveObject(ctx, s.cfg.Bucket, key, minio.RemoveObjectOptions{}); err != nil {
 		return fmt.Errorf("s3 delete s3://%s/%s: %w", s.cfg.Bucket, key, err)
 	}

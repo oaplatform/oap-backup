@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,9 +24,11 @@ type fakeRunner struct {
 	runs  []string
 	block chan struct{}
 	done  chan string
+	// err, when set, fails every run.
+	err error
 }
 
-func (f *fakeRunner) Run(ctx context.Context, t annotations.Target) error {
+func (f *fakeRunner) Run(ctx context.Context, t annotations.Target) (RunResult, error) {
 	if f.block != nil {
 		select {
 		case <-f.block:
@@ -38,7 +41,10 @@ func (f *fakeRunner) Run(ctx context.Context, t annotations.Target) error {
 	if f.done != nil {
 		f.done <- t.Key()
 	}
-	return nil
+	if f.err != nil {
+		return RunResult{}, f.err
+	}
+	return RunResult{Files: 2, SizeBytes: 300}, nil
 }
 
 func annotatedPod(ns, name, schedule string) *corev1.Pod {
@@ -96,6 +102,15 @@ func TestReconcile(t *testing.T) {
 	}
 	if v := testutil.ToFloat64(m.Metrics.InvalidTargets); v != 1 {
 		t.Errorf("invalid metric = %v", v)
+	}
+	if inv := m.Invalid(); len(inv) != 1 || inv[0].Key != "db/broken" || !strings.Contains(inv[0].Error, annotations.FileFolder) {
+		t.Errorf("Invalid() = %+v", inv)
+	}
+	if st, ok := m.Target("db/pg-0"); !ok || st.Target.Pod != "pg-0" || st.LastRun != nil || st.NextRun.IsZero() {
+		t.Errorf("Target(db/pg-0) = %+v, %v", st, ok)
+	}
+	if _, ok := m.Target("db/broken"); ok {
+		t.Error("Target(db/broken): invalid pod must not be a target")
 	}
 	if len(m.cron.Entries()) != 2 {
 		t.Errorf("cron entries = %d", len(m.cron.Entries()))
@@ -195,5 +210,52 @@ func TestRunShutdownCancelsRunningBackups(t *testing.T) {
 	}
 	if started, _ := m.Trigger("db/a"); len(started) != 0 {
 		t.Errorf("trigger after shutdown started %v", started)
+	}
+}
+
+func TestLastRun(t *testing.T) {
+	client := fake.NewClientset(annotatedPod("db", "a", ""))
+	r := &fakeRunner{done: make(chan string, 2)}
+	m := newManager(client, r)
+	m.Reconcile(context.Background())
+
+	wait := func() {
+		t.Helper()
+		select {
+		case <-r.done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("backup did not finish")
+		}
+		m.wg.Wait()
+	}
+
+	if _, err := m.Trigger("db/a"); err != nil {
+		t.Fatal(err)
+	}
+	wait()
+	st, _ := m.Target("db/a")
+	if st.Running || st.LastRun == nil {
+		t.Fatalf("status = %+v", st)
+	}
+	if l := st.LastRun; l.Trigger != TriggerManual || l.Error != "" || l.Files != 2 || l.SizeBytes != 300 ||
+		l.Started.IsZero() || l.Finished.Before(l.Started) {
+		t.Errorf("last run = %+v", l)
+	}
+
+	r.err = errors.New("boom")
+	m.runScheduled("db/a")
+	<-r.done
+	st, _ = m.Target("db/a")
+	if l := st.LastRun; l == nil || l.Trigger != TriggerSchedule || l.Error != "boom" || l.Files != 0 {
+		t.Errorf("last run after failure = %+v", l)
+	}
+
+	// The record goes away with the target.
+	if err := client.CoreV1().Pods("db").Delete(context.Background(), "a", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	m.Reconcile(context.Background())
+	if len(m.lastRun) != 0 {
+		t.Errorf("lastRun = %v, want empty", m.lastRun)
 	}
 }

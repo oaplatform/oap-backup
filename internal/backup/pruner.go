@@ -17,8 +17,9 @@ type PruneResult struct {
 }
 
 // Prune applies retention to <file-folder> (port of backup_pruner.py):
-//   - deletes every file that does not end with the target's backup suffix
-//     (stale or foreign files);
+//   - deletes every file that does not end with one of the target's backup
+//     suffixes (stale or foreign files). Backups made with another
+//     compression codec count as backups;
 //   - deletes the oldest backups until at most RetentionKeepLast remain. The
 //     fixed-width UTC timestamp in the file names makes lexicographic order
 //     chronological.
@@ -26,20 +27,26 @@ type PruneResult struct {
 // A missing folder is not an error. Deletion errors do not stop pruning of
 // the remaining files; they are returned joined.
 func (r *Runner) Prune(ctx context.Context, t annotations.Target) (PruneResult, error) {
-	log := r.Logger.With("target", t.Key(), "folder", t.FileFolder)
+	return r.pruneDir(ctx, t, t.FileFolder)
+}
 
-	names, err := r.Storage.List(ctx, t.FileFolder)
+// pruneDir applies t's retention to the storage folder dir: <file-folder>
+// itself, or one part folder of a partitioned target.
+func (r *Runner) pruneDir(ctx context.Context, t annotations.Target, dir string) (PruneResult, error) {
+	log := r.Logger.With("target", t.Key(), "folder", dir)
+
+	names, err := r.Storage.List(ctx, dir)
 	if err != nil {
 		return PruneResult{}, err
 	}
 
-	suffix := t.Suffix()
+	suffixes := strings.Join(t.Suffixes(), " or ")
 	var res PruneResult
 	var errs []error
 	var matching []string
 
 	del := func(name, reason string) {
-		if err := r.Storage.Delete(ctx, t.FileFolder, name); err != nil {
+		if err := r.Storage.Delete(ctx, dir, name); err != nil {
 			errs = append(errs, fmt.Errorf("delete %s: %w", name, err))
 			return
 		}
@@ -48,10 +55,10 @@ func (r *Runner) Prune(ctx context.Context, t annotations.Target) (PruneResult, 
 	}
 
 	for _, name := range names {
-		if strings.HasSuffix(name, suffix) {
+		if t.IsBackupFile(name) {
 			matching = append(matching, name)
 		} else {
-			del(name, "not a backup file (suffix "+suffix+")")
+			del(name, "not a backup file (suffix "+suffixes+")")
 		}
 	}
 

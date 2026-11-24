@@ -41,7 +41,11 @@ func HelperPodName(pod string) string {
 // the same data. Generic ephemeral volumes are rewritten to reference the
 // source pod's existing PVC instead of provisioning a new one. The service
 // account token is neither mounted nor copied.
-func BuildHelperPod(src *corev1.Pod, container, image string) (*corev1.Pod, error) {
+//
+// The helper container also gets the source container's env and envFrom, so
+// the backup command sees the same configuration and credentials (see
+// helperEnv), followed by env, which therefore wins on a name clash.
+func BuildHelperPod(src *corev1.Pod, container, image string, env []corev1.EnvVar) (*corev1.Pod, error) {
 	var source *corev1.Container
 	for i := range src.Spec.Containers {
 		if src.Spec.Containers[i].Name == container {
@@ -90,6 +94,8 @@ func BuildHelperPod(src *corev1.Pod, container, image string) (*corev1.Pod, erro
 				Name:         HelperContainer,
 				Image:        image,
 				Command:      []string{"sleep", "infinity"},
+				Env:          append(helperEnv(source), env...),
+				EnvFrom:      helperEnvFrom(source),
 				VolumeMounts: mounts,
 			}},
 			Volumes:                      volumes,
@@ -106,6 +112,41 @@ func BuildHelperPod(src *corev1.Pod, container, image string) (*corev1.Pod, erro
 	return pod, nil
 }
 
+// helperEnv copies the source container's env for the helper container.
+// Values taken from the pod (fieldRef) resolve against the helper pod, so
+// e.g. metadata.name yields the helper's name. A resourceFieldRef names a
+// container: one that points at the source container is redirected to the
+// helper container (which has no resources set, so node allocatable
+// applies), and one that points at another container is dropped, because
+// that container does not exist in the helper pod.
+func helperEnv(source *corev1.Container) []corev1.EnvVar {
+	var out []corev1.EnvVar
+	for _, e := range source.Env {
+		e := *e.DeepCopy()
+		if e.ValueFrom != nil && e.ValueFrom.ResourceFieldRef != nil {
+			ref := e.ValueFrom.ResourceFieldRef
+			if ref.ContainerName != "" && ref.ContainerName != source.Name {
+				continue
+			}
+			if ref.ContainerName != "" {
+				ref.ContainerName = HelperContainer
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// helperEnvFrom copies the source container's envFrom (ConfigMap and Secret
+// references; they are in the helper pod's namespace too).
+func helperEnvFrom(source *corev1.Container) []corev1.EnvFromSource {
+	var out []corev1.EnvFromSource
+	for _, e := range source.EnvFrom {
+		out = append(out, *e.DeepCopy())
+	}
+	return out
+}
+
 // Helpers creates and deletes helper pods.
 type Helpers struct {
 	Client       kubernetes.Interface
@@ -120,15 +161,15 @@ func (h *Helpers) poll() time.Duration {
 	return 2 * time.Second
 }
 
-// Create starts a helper pod for namespace/pod's container and waits until it
-// is Running. A stale helper with the same name is deleted first. On error,
+// Create starts a helper pod for namespace/pod's container, with env set on
+// its container, and waits until it is Running. A stale helper with the same name is deleted first. On error,
 // any helper pod that was created is deleted again. Returns the helper name.
-func (h *Helpers) Create(ctx context.Context, namespace, pod, container, image string) (string, error) {
+func (h *Helpers) Create(ctx context.Context, namespace, pod, container, image string, env []corev1.EnvVar) (string, error) {
 	src, err := h.Client.CoreV1().Pods(namespace).Get(ctx, pod, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("reading source pod: %w", err)
 	}
-	manifest, err := BuildHelperPod(src, container, image)
+	manifest, err := BuildHelperPod(src, container, image, env)
 	if err != nil {
 		return "", err
 	}

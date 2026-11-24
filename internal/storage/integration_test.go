@@ -11,9 +11,11 @@ package storage
 import (
 	"context"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,6 +58,38 @@ func exercise(t *testing.T, s Storage) {
 	names, err = s.List(ctx, dir)
 	if err != nil || !reflect.DeepEqual(names, []string{"backup-2.sql.gz"}) {
 		t.Fatalf("List after delete = %v, %v", names, err)
+	}
+
+	files, err := s.ListFiles(ctx, dir)
+	if err != nil || len(files) != 1 || files[0].Name != "backup-2.sql.gz" || files[0].Size != int64(len("backup-bytes")) {
+		t.Fatalf("ListFiles = %+v, %v", files, err)
+	}
+	if age := time.Since(files[0].ModTime); age < -time.Hour || age > 24*time.Hour {
+		t.Errorf("ListFiles ModTime = %s, want about now", files[0].ModTime)
+	}
+	if files, err := s.ListFiles(ctx, dir+"/missing"); err != nil || len(files) != 0 {
+		t.Fatalf("ListFiles(missing) = %v, %v; want empty, nil", files, err)
+	}
+
+	// Folders: dir's parent holds exactly one folder; an emptied folder can
+	// be removed and is then no longer listed.
+	parent, base := path.Split(dir)
+	parent = strings.TrimSuffix(parent, "/")
+	dirs, err := s.ListDirs(ctx, parent)
+	if err != nil || !reflect.DeepEqual(dirs, []string{base}) {
+		t.Fatalf("ListDirs(%s) = %v, %v; want [%s]", parent, dirs, err, base)
+	}
+	if dirs, err := s.ListDirs(ctx, dir+"/missing"); err != nil || len(dirs) != 0 {
+		t.Fatalf("ListDirs(missing) = %v, %v; want empty, nil", dirs, err)
+	}
+	if err := s.Delete(ctx, dir, "backup-2.sql.gz"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := s.RemoveDir(ctx, dir); err != nil {
+		t.Fatalf("RemoveDir: %v", err)
+	}
+	if dirs, err := s.ListDirs(ctx, parent); err != nil || len(dirs) != 0 {
+		t.Fatalf("ListDirs after RemoveDir = %v, %v; want empty, nil", dirs, err)
 	}
 
 	// A cancelled context aborts operations.

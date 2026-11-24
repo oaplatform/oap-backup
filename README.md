@@ -4,8 +4,8 @@ Kubernetes service that backs up pods which opt in through `oap/backup-*`
 annotations. Each pod sets its **own schedule** (cron) in an annotation. On
 that schedule oap-backup runs the pod's backup command with `kubectl exec`
 semantics. The command runs either in the pod itself or in a short-lived
-helper pod that mounts the same volumes. oap-backup gzips the output if it is
-not compressed yet, uploads it to **FTP** or **S3-compatible** storage, and
+helper pod that mounts the same volumes. oap-backup compresses the output
+(gzip or zstd) if it is not compressed yet, uploads it to **FTP** or **S3-compatible** storage, and
 keeps only the newest *N* files.
 
 It replaces the Airflow DAG `system_backup` (`ml-orchestrator/dags/system_backup_dag.py`),
@@ -29,10 +29,11 @@ oap-backup runs as a single-replica Deployment.
       and waits until it is `Running` (`--helper_timeout`).
    2. *backup*: runs `sh -c "<oap/backup-command>"` in the target container.
       stdout is the backup stream and stderr is logged line by line. stdout is
-      written to a temp file in `--tmp_dir`, gzip-compressed unless
-      `oap/backup-file-extension` already ends in `.gz`. A non-zero exit code
-      fails the attempt. The file is uploaded as
-      `<storage root>/<oap/backup-file-folder>/backup-<YYYYMMDDHHMMSS><ext>[.gz]`
+      written to a temp file in `--tmp_dir`, compressed unless
+      `oap/backup-file-extension` already ends in `.gz` or `.zst` (see
+      [Compression](#compression)). A non-zero exit code fails the attempt.
+      The file is uploaded as
+      `<storage root>/<oap/backup-file-folder>/backup-<YYYYMMDDHHMMSS><ext>[.gz|.zst]`
       (UTC timestamp). The temp file is always deleted. Each attempt is limited
       by `--backup_timeout`. A failed attempt is retried `--retries` times,
       `--retry_delay` apart.
@@ -59,10 +60,14 @@ Set on the **Pod**. With a Deployment or StatefulSet, put them in
 | `oap/backup-command` | **yes** | Shell command whose **stdout** is the backup, run as `sh -c "<command>"`. Its presence opts the pod in. |
 | `oap/backup-schedule` | no | The pod's own schedule (see [Schedule syntax](#schedule-syntax)). Default: `--default_schedule` (`@daily`). |
 | `oap/backup-file-folder` | **yes** | Folder under the storage root, e.g. `db/postgres`. Leading/trailing `/` are ignored; `.` and `..` segments are rejected. |
-| `oap/backup-file-extension` | **yes** | File extension, e.g. `.sql`, `.archive.gz`. If it ends in `.gz`, the output is stored as is. Otherwise `.gz` is appended and the stream is gzipped. |
+| `oap/backup-file-extension` | **yes** | File extension, e.g. `.sql`, `.archive.gz`. If it ends in `.gz` or `.zst`, the output is stored as is. Otherwise the stream is compressed and `.gz` or `.zst` is appended. |
+| `oap/backup-compression` | no | `gzip` or `zstd`: how oap-backup compresses the output. Default: `gzip`. See [Compression](#compression). |
+| `oap/backup-compression-level` | no | Integer: `1`–`9` for gzip, `1`–`22` for zstd. Default: the codec's default level. |
 | `oap/backup-retention-keep-last` | **yes** | Integer ≥ 1: how many newest backups to keep in the folder. |
 | `oap/backup-container` | no | Container to exec into (and whose volume mounts a helper pod copies). Must exist in the pod spec. Default: the first container. |
-| `oap/backup-external-container-image` | no | Run the command in a helper pod with this image instead of in the pod itself. |
+| `oap/backup-external-container-image` | no | Run the command in a helper pod with this image instead of in the pod itself. Required with `oap/backup-parts`. |
+| `oap/backup-parts` | no | `true` enables [partitioned backups](#partitioned-backups). Default: `false`. |
+| `oap/backup-parts-command` | with parts | Shell command that prints the list of parts. |
 
 If a pod's annotations are invalid (missing required key, bad cron, unknown
 container, ...), oap-backup logs a warning naming the pod and the problem, and
@@ -114,6 +119,24 @@ spec:
 
 More examples are in [`deploy/examples/`](deploy/examples).
 
+### Compression
+
+| `oap/backup-compression` | Suffix | `oap/backup-compression-level` | Default level |
+|---|---|---|---|
+| `gzip` (default) | `.gz` | `1` (fastest) – `9` (smallest) | `6` |
+| `zstd` | `.zst` | `1` (fastest) – `22` (smallest) | `3` |
+
+- If `oap/backup-file-extension` already ends in `.gz` or `.zst`, the command
+  compresses its own output. It is stored as is, and both annotations are
+  ignored.
+- zstd has four encoder presets, and a level selects the nearest one: `1`–`2`
+  fastest, `3`–`6` default, `7`–`10` better, `11`–`22` best. Levels inside one
+  group produce the same output.
+- You can change the codec at any time. Backups made with the other codec
+  stay in the folder and count towards `oap/backup-retention-keep-last`
+  together with the new ones.
+- To restore: `gunzip -c backup-….sql.gz` or `zstd -dc backup-….sql.zst`.
+
 Typical commands:
 
 | Database | `oap/backup-command` | `oap/backup-file-extension` |
@@ -136,6 +159,11 @@ With `oap/backup-external-container-image`, the backup runs in a pod named
 - runs the given image with `sleep infinity` and `restartPolicy: Never`;
 - has the same `volumes` and, for the target container, the same
   `volumeMounts` (same paths) as the source pod;
+- has the target container's `env` and `envFrom`, so the command sees the
+  same variables (passwords, hosts, ...) as in the pod itself. Values from
+  `fieldRef` describe the helper pod, e.g. `metadata.name` is
+  `<pod>-backup-helper`. A `resourceFieldRef` to another container is
+  dropped;
 - is pinned to the source pod's node (`nodeName`) and copies its
   `tolerations`, `imagePullSecrets` and pod `securityContext`. ReadWriteOnce
   PVCs, local PVs and `hostPath` volumes therefore resolve to the same data;
@@ -149,10 +177,73 @@ With `oap/backup-external-container-image`, the backup runs in a pod named
 Use a helper pod when the application image has no dump/archive tools.
 `emptyDir` volumes are **not** shared: the helper pod gets a new, empty one.
 
+## Partitioned backups
+
+For data that consists of independent parts (table partitions, per-tenant
+databases, directories), `oap/backup-parts: "true"` backs up only the parts
+that changed since their last backup. Each part has its own folder:
+
+```
+<storage root>/<oap/backup-file-folder>/<part>/backup-<YYYYMMDDHHMMSS><ext>[.gz|.zst]
+```
+
+This mode always runs in a helper pod, so
+`oap/backup-external-container-image` is required. One run:
+
+1. oap-backup reads the part folders from the storage. For each one it takes
+   the timestamp of the newest backup file.
+2. It creates the helper pod with this state in the container's environment:
+
+   | Variable | Value |
+   |---|---|
+   | `PART_COUNT` | number of parts on the storage |
+   | `PART<X>_ID` | part id, `X` = `0` … `PART_COUNT - 1` |
+   | `PART<X>_MT` | timestamp of its newest backup (`YYYYMMDDHHMMSS`, UTC); empty if the folder has no backup |
+
+3. It runs `sh -c "<oap/backup-parts-command>"` in the helper pod. The command
+   prints one line per part that **exists now**:
+
+   ```
+   <part>=<YYYYMMDDHHMMSS>   # new, or modified after PART<X>_MT: back it up
+   <part>=SKIP               # not modified: nothing to do
+   ```
+
+   The timestamp is the part's modification time in UTC. Blank lines and `#`
+   comments are ignored. A stored part that is not printed no longer exists
+   and is not backed up. stderr is logged.
+4. For every part with a timestamp, in the printed order, it runs
+   `oap/backup-command` in the same helper pod with every `{PART_ID}` replaced
+   by the part id. The output is handled like any other backup (see
+   [Compression](#compression)) and uploaded as
+   `<part>/backup-<that timestamp><ext>[.gz|.zst]`. So the next run gets exactly
+   this timestamp back in `PART<X>_MT`.
+5. Retention runs for every part folder (see [Retention](#retention)).
+
+Rules:
+
+- `{PART_ID}` is **required** in `oap/backup-command`. Without it the pod is
+  invalid and skipped.
+- A part id may contain letters, digits, `.`, `_` and `-`, and must start
+  with a letter or digit. It is used as a folder name and inside the shell
+  command.
+- If the parts command fails or prints an invalid line, the attempt fails and
+  no part is backed up.
+- A failed part does not stop the other parts, but the attempt counts as
+  failed and is retried (`--retries`). A retry starts again from step 1 in a
+  new helper pod, so parts that were already uploaded come back in
+  `PART<X>_MT` and the parts command answers `SKIP` for them.
+- `--backup_timeout` applies to steps 1–3 together and to each part backup
+  separately.
+- The parts of one pod are backed up one after another.
+
+See [`deploy/examples/parts.yaml`](deploy/examples/parts.yaml).
+
 ## Storage
 
 Select it with `--storage=ftp` or `--storage=s3`. Files are stored as
-`<root>/<oap/backup-file-folder>/backup-<YYYYMMDDHHMMSS><suffix>`.
+`<root>/<oap/backup-file-folder>/backup-<YYYYMMDDHHMMSS><suffix>`, or, for
+[partitioned backups](#partitioned-backups), as
+`<root>/<oap/backup-file-folder>/<part>/backup-<YYYYMMDDHHMMSS><suffix>`.
 
 - **FTP**: the root is `--ftp_folder` (default `/`). The path is absolute on
   the server, so on servers that do not chroot users, point it at a writable
@@ -170,14 +261,22 @@ Select it with `--storage=ftp` or `--storage=s3`. Files are stored as
 
 After each run, for `<root>/<folder>`, the same way as the DAG's pruner:
 
-1. every file whose name does **not** end with the target's suffix
-   (`<ext>.gz`, or `<ext>` if it already ends in `.gz`) is deleted;
+1. every file whose name does **not** end with a suffix of the target is
+   deleted. The suffixes are `<ext>.gz` and `<ext>.zst`, whichever codec is
+   selected now, or only `<ext>` if it already ends in `.gz` or `.zst`;
 2. the remaining files are sorted by name (the fixed-width timestamp makes
    this chronological) and the oldest are deleted until
    `oap/backup-retention-keep-last` remain.
 
 A missing folder is not an error. **Give every pod its own folder** and keep
 nothing else in it: foreign files there are deleted.
+
+For [partitioned backups](#partitioned-backups) the same two steps run for
+every part folder `<root>/<folder>/<part>`, including parts that no longer
+exist. A part folder that ends up empty is removed. Retention counts files, so
+a part that no longer exists keeps its last `oap/backup-retention-keep-last`
+backups until you delete them. Files directly in `<root>/<folder>` and
+folders whose name is not a valid part id are not touched.
 
 ## Flags
 
@@ -190,7 +289,7 @@ nothing else in it: foreign files there are deleted.
 | `--max_concurrent` | `2` | Maximum number of backups running at the same time. |
 | `--retries` | `2` | Retries of a failed backup. |
 | `--retry_delay` | `5m` | Delay between retries. |
-| `--backup_timeout` | `1h` | Timeout of one attempt (helper pod + exec + upload). Also bounds pruning. |
+| `--backup_timeout` | `1h` | Timeout of one attempt (helper pod + exec + upload). Also bounds pruning. With `oap/backup-parts`: of listing the parts, and of each part backup. |
 | `--helper_timeout` | `2m` | How long to wait for a helper pod to become `Running`. |
 | `--tmp_dir` | `/tmp` | Where backups are staged before upload. Needs room for `--max_concurrent` compressed dumps. |
 | `--shutdown_timeout` | `30s` | On `SIGTERM`, how long running backups may finish before they are cancelled. Keep it below `terminationGracePeriodSeconds`. |
@@ -215,6 +314,71 @@ nothing else in it: foreign files there are deleted.
 
 Secrets are read only from the environment, never from flags.
 
+## CLI
+
+The same binary is also a command-line client of the running service. It is
+in the image, so the simplest way to use it is `kubectl exec`:
+
+```sh
+alias oapb='kubectl -n oap-backup exec deploy/oap-backup -- /oap-backup'
+
+oapb list                          # backups that oap-backup detected
+oapb describe db/postgres-0        # everything about one backup
+oapb run db/postgres-0 --wait      # back up this pod now
+```
+
+| Command | Description |
+|---|---|
+| `list [-o table\|json]` | Every pod with `oap/backup-command`: status (`scheduled` / `running`), mode (`single` / `parts`), schedule, time to the next run, result of the last run, folder. Pods skipped because of invalid annotations are listed below, with the error. |
+| `describe <namespace>/<pod> [-o table\|json]` | The parsed annotations, next run, last run (trigger, start, duration, uploaded files and size, error), and the storage: every file in the backup folder with its backup time and size, newest first. For [partitioned backups](#partitioned-backups): the same for every part folder. Files that the next retention run deletes are marked. |
+| `run <namespace>/<pod> [--wait] [--timeout <duration>]` | Start a backup of the pod now. It fails if the pod is not scheduled or its backup is already running. |
+| `run --all [--wait] [--timeout <duration>]` | Start a backup of every scheduled pod that is not running one. |
+| `help` | Print the usage. |
+
+- `--wait` waits until the started backups finish and prints each result.
+  `--timeout` (e.g. `30m`) limits the wait. The backup itself keeps running
+  when the wait times out or the CLI is interrupted.
+- Exit codes: `0` success; `1` the request failed, the backup failed
+  (`--wait`) or the wait timed out; `2` wrong usage.
+- The CLI talks to the service over HTTP: `--server <url>`, else
+  `$OAP_BACKUP_SERVER`, else `http://localhost:9090`. The default works inside
+  the oap-backup pod. From your machine, use
+  `kubectl -n oap-backup port-forward svc/oap-backup 9090:9090`, or run the
+  image: `docker run --rm --network host oap-backup list`.
+- "Last run" is kept in memory: it is empty after oap-backup restarts, and
+  only covers runs since then. The files on the storage are always read live.
+- Without a subcommand, the binary runs the service.
+
+```
+$ oapb list
+TARGET          STATUS     MODE    SCHEDULE     NEXT RUN  LAST RUN       FOLDER
+app/tenants-0   scheduled  parts   0 */6 * * *  in 2h14m  ok 3h45m ago   app/tenants
+db/postgres-0   running    single  0 */6 * * *  in 2h14m  failed 6h ago  db/postgres
+
+INVALID (skipped)  ERROR
+db/mongo-0         missing required annotation oap/backup-file-folder
+
+$ oapb describe db/postgres-0
+Target:       db/postgres-0
+Status:       scheduled
+Mode:         single
+Container:    postgres
+Command:      pg_dumpall -U postgres
+Schedule:     0 */6 * * *
+Next run:     2026-11-24 18:00:00 UTC (in 2h14m)
+Folder:       db/postgres
+Extension:    .sql
+Compression:  zstd (level 19)
+Keep last:    8
+Last run:     ok, 3h45m ago (schedule, started 2026-11-24 12:00:00 UTC, took 42s, uploaded 1 file, 118.4 MiB)
+Storage:      s3://backups/prod (endpoint s3.example.com)
+
+db/postgres: 2 backups, 236.1 MiB, newest 2026-11-24 12:00:00 UTC
+  FILE                           BACKUP TIME              SIZE       NOTE
+  backup-20261124120000.sql.zst  2026-11-24 12:00:00 UTC  118.4 MiB
+  backup-20261124060000.sql.zst  2026-11-24 06:00:00 UTC  117.7 MiB
+```
+
 ## HTTP endpoints
 
 Served on `--metrics_port` (9090):
@@ -223,17 +387,22 @@ Served on `--metrics_port` (9090):
 |---|---|
 | `GET /metrics` | Prometheus metrics. |
 | `GET /healthz` | Liveness/readiness, returns `ok`. |
-| `GET /targets` | JSON list of scheduled pods: parsed annotations, `next_run`, `running`. |
-| `POST /run?target=<namespace>/<pod>` | Start a backup of one pod now (replaces the DAG's `force` param). Returns `202 {"started": [...]}`, or `404` if the pod is not scheduled. |
-| `POST /run` | Start a backup of **every** scheduled pod now. |
+| `GET /targets` | `{"targets": [...], "invalid": [...]}`. `targets`: scheduled pods with parsed annotations, `next_run`, `running`, `last_run`. `invalid`: pods skipped because of their annotations, with the error. |
+| `GET /targets/<namespace>/<pod>` | One scheduled pod, as in `/targets`, plus `storage`: its location and the files of the backup folder (or of every part folder). If the storage cannot be read, `storage.error` is set. `404` if the pod is not scheduled. |
+| `POST /run?target=<namespace>/<pod>` | Start a backup of one pod now (replaces the DAG's `force` param). Returns `202 {"started": [...]}`, `404` if the pod is not scheduled, or `409` if its backup is already running. |
+| `POST /run` | Start a backup of **every** scheduled pod that is not running one. |
+
+The [CLI](#cli) is a client of these endpoints. Errors are returned as
+`{"error": "..."}`.
 
 ```sh
 kubectl -n oap-backup port-forward svc/oap-backup 9090:9090
 curl -s localhost:9090/targets
+curl -s localhost:9090/targets/db/postgres-0
 curl -s -X POST 'localhost:9090/run?target=db/postgres-0'
 ```
 
-`/run` has no authentication. Do not expose the service outside the cluster.
+The API has no authentication. Do not expose the service outside the cluster.
 
 ## Metrics
 
@@ -244,12 +413,19 @@ same when a pod is recreated under a new name.
 |---|---|---|
 | `oap_backup_runs_total{namespace,folder,result}` | counter | Runs (after retries), `result` = `success` / `failure`. |
 | `oap_backup_last_success_timestamp_seconds{namespace,folder}` | gauge | Unix time of the last successful backup. |
-| `oap_backup_last_size_bytes{namespace,folder}` | gauge | Size of the last uploaded file. |
+| `oap_backup_last_size_bytes{namespace,folder}` | gauge | Size of the last uploaded file. With `oap/backup-parts`: total size of the parts uploaded by the last successful run (`0` if nothing changed). |
 | `oap_backup_last_duration_seconds{namespace,folder}` | gauge | Duration of the last run, including retries. |
 | `oap_backup_pruned_files_total{namespace,folder}` | counter | Files deleted by retention. |
 | `oap_backup_prune_failures_total{namespace,folder}` | counter | Failed prune runs. |
+| `oap_backup_parts{namespace,folder,state}` | gauge | [Partitioned backups](#partitioned-backups): parts by `state`, as of the last parts listing. `changed` = to back up, `unchanged` = `SKIP`, `gone` = on the storage but no longer listed. |
+| `oap_backup_part_backups_total{namespace,folder,result}` | counter | Backups of single parts, `result` = `success` / `failure`. Every attempt counts, so a retried part counts again. |
+| `oap_backup_parts_stored{namespace,folder}` | gauge | Part folders on the storage after the last retention run. |
+| `oap_backup_part_folders_pruned_total{namespace,folder}` | counter | Empty part folders removed by retention. |
 | `oap_backup_targets` | gauge | Scheduled pods. |
 | `oap_backup_invalid_targets` | gauge | Opted-in pods skipped due to invalid annotations. |
+
+The part metrics are per pod, not per part: a `part` label would create one
+series for every part. For a single part, use `oap-backup describe`.
 
 Example alerts:
 
@@ -262,6 +438,8 @@ Example alerts:
   expr: increase(oap_backup_runs_total{result="failure"}[6h]) > 0
 - alert: BackupInvalidAnnotations
   expr: oap_backup_invalid_targets > 0
+- alert: BackupPartsFailing
+  expr: increase(oap_backup_part_backups_total{result="failure"}[6h]) > 0
 ```
 
 ## Kubernetes
@@ -326,6 +504,9 @@ as before.
   prunes the same folder. Annotate one pod per folder.
 - `emptyDir` content is not visible to helper pods.
 - The backup is staged on local disk before upload. It is not streamed.
+- With `oap/backup-parts`, the stored parts are passed as environment
+  variables of the helper pod (three per part plus one). Thousands of parts
+  work; hundreds of thousands exceed the size limit of a pod object.
 
 ## Docker
 

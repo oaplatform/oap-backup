@@ -41,7 +41,7 @@ func TestParseDefaults(t *testing.T) {
 	want := Target{
 		Namespace: "db", Pod: "postgres-0", Container: "postgres", Command: "pg_dumpall -U postgres",
 		Schedule: "@daily", FileFolder: "postgres", FileExtension: ".sql", RetentionKeepLast: 7,
-		Compression: Gzip,
+		Compression: None,
 	}
 	if tg != want {
 		t.Fatalf("got %+v\nwant %+v", tg, want)
@@ -91,8 +91,10 @@ func TestParseErrors(t *testing.T) {
 		"unknown container": func(a map[string]string) { a[Container] = "nope" },
 		"bad compression":   func(a map[string]string) { a[Compression] = "xz" },
 		"text level":        func(a map[string]string) { a[CompressionLevel] = "max" },
-		"zero level":        func(a map[string]string) { a[CompressionLevel] = "0" },
-		"gzip level 10":     func(a map[string]string) { a[CompressionLevel] = "10" },
+		"zero level":        func(a map[string]string) { a[Compression] = "gzip"; a[CompressionLevel] = "0" },
+		"gzip level 10":     func(a map[string]string) { a[Compression] = "gzip"; a[CompressionLevel] = "10" },
+		"level, no codec":   func(a map[string]string) { a[CompressionLevel] = "6" },
+		"level with none":   func(a map[string]string) { a[Compression] = "none"; a[CompressionLevel] = "6" },
 		"zstd level 23":     func(a map[string]string) { a[Compression] = "zstd"; a[CompressionLevel] = "23" },
 	}
 	for name, mutate := range cases {
@@ -112,7 +114,13 @@ func TestParseErrors(t *testing.T) {
 
 func TestFileNaming(t *testing.T) {
 	now := time.Date(2026, 11, 10, 1, 30, 5, 0, time.FixedZone("x", 2*3600))
-	plain := Target{FileExtension: ".sql"}
+	// No codec, as the zero value and as the explicit None: stored as is.
+	for _, none := range []Target{{FileExtension: ".sql"}, {FileExtension: ".sql", Compression: None}} {
+		if none.Codec() != "" || none.Precompressed() || none.Suffix() != ".sql" || none.FileName(now) != "backup-20261109233005.sql" {
+			t.Errorf("none: codec=%q suffix=%q name=%q", none.Codec(), none.Suffix(), none.FileName(now))
+		}
+	}
+	plain := Target{FileExtension: ".sql", Compression: Gzip}
 	if plain.Codec() != Gzip || plain.Suffix() != ".sql.gz" || plain.FileName(now) != "backup-20261109233005.sql.gz" {
 		t.Errorf("plain: codec=%q suffix=%q name=%q", plain.Codec(), plain.Suffix(), plain.FileName(now))
 	}
@@ -130,13 +138,14 @@ func TestFileNaming(t *testing.T) {
 		t.Errorf("precompressed: codec=%q suffix=%q", pre.Codec(), pre.Suffix())
 	}
 
-	// Backups of the other codec are still this target's backup files.
-	for _, name := range []string{"backup-1.sql.gz", "backup-1.sql.zst"} {
-		if !plain.IsBackupFile(name) || !zst.IsBackupFile(name) {
+	// Backups of another codec, or of none, are still this target's backup
+	// files.
+	for _, name := range []string{"backup-1.sql", "backup-1.sql.gz", "backup-1.sql.zst"} {
+		if !plain.IsBackupFile(name) || !zst.IsBackupFile(name) || !(Target{FileExtension: ".sql"}).IsBackupFile(name) {
 			t.Errorf("IsBackupFile(%q) = false", name)
 		}
 	}
-	for _, name := range []string{"backup-1.sql", "backup-1.tar.gz", "notes.txt"} {
+	for _, name := range []string{"backup-1.sqlite", "backup-1.tar.gz", "notes.txt"} {
 		if plain.IsBackupFile(name) {
 			t.Errorf("IsBackupFile(%q) = true", name)
 		}
@@ -155,10 +164,26 @@ func TestParseCompression(t *testing.T) {
 		t.Fatalf("target %+v, err %v", tg, err)
 	}
 	ann = valid()
+	ann[Compression] = "gzip"
 	ann[CompressionLevel] = "9"
 	tg, _, err = Parse(pod(ann, "postgres"), "@daily")
 	if err != nil || tg.Compression != Gzip || tg.CompressionLevel != 9 {
 		t.Fatalf("target %+v, err %v", tg, err)
+	}
+	// None is the default and can be set explicitly.
+	for _, value := range []string{"", "none", " None "} {
+		ann = valid()
+		ann[Compression] = value
+		tg, _, err = Parse(pod(ann, "postgres"), "@daily")
+		if err != nil || tg.Compression != None || tg.Codec() != "" || tg.Suffix() != ".sql" {
+			t.Errorf("compression %q: target %+v, err %v", value, tg, err)
+		}
+	}
+	// A level without a compressing codec names the missing annotation.
+	ann = valid()
+	ann[CompressionLevel] = "6"
+	if _, _, err = Parse(pod(ann, "postgres"), "@daily"); err == nil || !strings.Contains(err.Error(), "requires "+Compression) {
+		t.Errorf("level without codec: err = %v", err)
 	}
 }
 
@@ -241,7 +266,10 @@ func TestTimestamp(t *testing.T) {
 	if ts, ok := tg.Timestamp("backup-20261105101500.sql.zst"); !ok || FormatTimestamp(ts) != "20261105101500" {
 		t.Errorf("other codec: ts=%v ok=%v", ts, ok)
 	}
-	for _, name := range []string{"backup-20261105101500.sql", "backup-2026.sql.gz", "notes.txt", "x-20261105101500.sql.gz"} {
+	if ts, ok := tg.Timestamp("backup-20261105101500.sql"); !ok || FormatTimestamp(ts) != "20261105101500" {
+		t.Errorf("no codec: ts=%v ok=%v", ts, ok)
+	}
+	for _, name := range []string{"backup-20261105101500.sqlite", "backup-2026.sql.gz", "notes.txt", "x-20261105101500.sql.gz"} {
 		if _, ok := tg.Timestamp(name); ok {
 			t.Errorf("Timestamp(%q): want !ok", name)
 		}

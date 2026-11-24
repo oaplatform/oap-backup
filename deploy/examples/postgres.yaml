@@ -1,5 +1,6 @@
 # PostgreSQL backed up every 6 hours with pg_dumpall, run inside the
-# postgres container itself. Output is plain SQL, so oap-backup gzips it:
+# postgres container itself. Output is plain SQL; oap/backup-compression
+# makes oap-backup gzip it (without the annotation it is stored as is):
 # files are named backup-<YYYYMMDDHHMMSS>.sql.gz; the newest 8 are kept.
 apiVersion: apps/v1
 kind: StatefulSet
@@ -21,6 +22,7 @@ spec:
         oap/backup-schedule: "0 */6 * * *"
         oap/backup-file-folder: "db/postgres"
         oap/backup-file-extension: ".sql"
+        oap/backup-compression: "gzip"
         oap/backup-retention-keep-last: "8"
         oap/backup-container: "postgres"
     spec:

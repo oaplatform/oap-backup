@@ -86,6 +86,20 @@ func TestHumanSize(t *testing.T) {
 	}
 }
 
+func TestCompression(t *testing.T) {
+	cases := map[string]annotations.Target{
+		"none": {FileExtension: ".sql"},
+		"none (the command output is already compressed)": {FileExtension: ".tar.gz", Compression: annotations.Zstd},
+		"gzip (default level)":                            {FileExtension: ".sql", Compression: annotations.Gzip},
+		"zstd (level 19)":                                 {FileExtension: ".sql", Compression: annotations.Zstd, CompressionLevel: 19},
+	}
+	for want, target := range cases {
+		if got := compression(target); got != want {
+			t.Errorf("compression(%+v) = %q, want %q", target, got, want)
+		}
+	}
+}
+
 func TestPluralAndOneLine(t *testing.T) {
 	if plural(1, "file") != "1 file" || plural(0, "file") != "0 files" || plural(2, "backup") != "2 backups" {
 		t.Error("plural")

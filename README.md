@@ -4,8 +4,8 @@ Kubernetes service that backs up pods which opt in through `oap/backup-*`
 annotations. Each pod sets its **own schedule** (cron) in an annotation. On
 that schedule oap-backup runs the pod's backup command with `kubectl exec`
 semantics. The command runs either in the pod itself or in a short-lived
-helper pod that mounts the same volumes. oap-backup compresses the output
-(gzip or zstd) if it is not compressed yet, uploads it to **FTP** or **S3-compatible** storage, and
+helper pod that mounts the same volumes. oap-backup optionally compresses the
+output (gzip or zstd), uploads it to **FTP** or **S3-compatible** storage, and
 keeps only the newest *N* files.
 
 It replaces the Airflow DAG `system_backup` (`ml-orchestrator/dags/system_backup_dag.py`),
@@ -29,9 +29,8 @@ oap-backup runs as a single-replica Deployment.
       and waits until it is `Running` (`--helper_timeout`).
    2. *backup*: runs `sh -c "<oap/backup-command>"` in the target container.
       stdout is the backup stream and stderr is logged line by line. stdout is
-      written to a temp file in `--tmp_dir`, compressed unless
-      `oap/backup-file-extension` already ends in `.gz` or `.zst` (see
-      [Compression](#compression)). A non-zero exit code fails the attempt.
+      written to a temp file in `--tmp_dir`, compressed if
+      `oap/backup-compression` says so (see [Compression](#compression)). A non-zero exit code fails the attempt.
       The file is uploaded as
       `<storage root>/<oap/backup-file-folder>/backup-<YYYYMMDDHHMMSS><ext>[.gz|.zst]`
       (UTC timestamp). The temp file is always deleted. Each attempt is limited
@@ -60,9 +59,9 @@ Set on the **Pod**. With a Deployment or StatefulSet, put them in
 | `oap/backup-command` | **yes** | Shell command whose **stdout** is the backup, run as `sh -c "<command>"`. Its presence opts the pod in. |
 | `oap/backup-schedule` | no | The pod's own schedule (see [Schedule syntax](#schedule-syntax)). Default: `--default_schedule` (`@daily`). |
 | `oap/backup-file-folder` | **yes** | Folder under the storage root, e.g. `db/postgres`. Leading/trailing `/` are ignored; `.` and `..` segments are rejected. |
-| `oap/backup-file-extension` | **yes** | File extension, e.g. `.sql`, `.archive.gz`. If it ends in `.gz` or `.zst`, the output is stored as is. Otherwise the stream is compressed and `.gz` or `.zst` is appended. |
-| `oap/backup-compression` | no | `gzip` or `zstd`: how oap-backup compresses the output. Default: `gzip`. See [Compression](#compression). |
-| `oap/backup-compression-level` | no | Integer: `1`–`9` for gzip, `1`–`22` for zstd. Default: the codec's default level. |
+| `oap/backup-file-extension` | **yes** | File extension, e.g. `.sql`, `.archive.gz`. With `oap/backup-compression` `gzip` or `zstd`, `.gz` or `.zst` is appended, unless the extension already ends in `.gz` or `.zst`. |
+| `oap/backup-compression` | no | `none`, `gzip` or `zstd`: how oap-backup compresses the output. Default: `none` (stored as is). See [Compression](#compression). |
+| `oap/backup-compression-level` | no | Integer: `1`–`9` for gzip, `1`–`22` for zstd. Default: the codec's default level. Not allowed with `none`. |
 | `oap/backup-retention-keep-last` | **yes** | Integer ≥ 1: how many newest backups to keep in the folder. |
 | `oap/backup-container` | no | Container to exec into (and whose volume mounts a helper pod copies). Must exist in the pod spec. Default: the first container. |
 | `oap/backup-external-container-image` | no | Run the command in a helper pod with this image instead of in the pod itself. Required with `oap/backup-parts`. |
@@ -112,6 +111,7 @@ spec:
         oap/backup-schedule: "0 */6 * * *"
         oap/backup-file-folder: "db/postgres"
         oap/backup-file-extension: ".sql"
+        oap/backup-compression: "gzip"
         oap/backup-retention-keep-last: "8"
         oap/backup-container: "postgres"
     # ...
@@ -123,18 +123,25 @@ More examples are in [`deploy/examples/`](deploy/examples).
 
 | `oap/backup-compression` | Suffix | `oap/backup-compression-level` | Default level |
 |---|---|---|---|
-| `gzip` (default) | `.gz` | `1` (fastest) – `9` (smallest) | `6` |
+| `none` (default) | — | not allowed | — |
+| `gzip` | `.gz` | `1` (fastest) – `9` (smallest) | `6` |
 | `zstd` | `.zst` | `1` (fastest) – `22` (smallest) | `3` |
 
+- Without `oap/backup-compression`, or with `none`, the command output is
+  stored byte for byte as `backup-<timestamp><ext>`. Plain-text dumps (SQL)
+  usually shrink several times with `gzip` or `zstd`, so set one of them
+  unless the command already compresses.
+- `oap/backup-compression-level` together with `none` makes the pod invalid,
+  so that a forgotten codec does not go unnoticed.
 - If `oap/backup-file-extension` already ends in `.gz` or `.zst`, the command
   compresses its own output. It is stored as is, and both annotations are
   ignored.
 - zstd has four encoder presets, and a level selects the nearest one: `1`–`2`
   fastest, `3`–`6` default, `7`–`10` better, `11`–`22` best. Levels inside one
   group produce the same output.
-- You can change the codec at any time. Backups made with the other codec
-  stay in the folder and count towards `oap/backup-retention-keep-last`
-  together with the new ones.
+- You can change the codec at any time. Backups made with another codec,
+  or with none, stay in the folder and count towards
+  `oap/backup-retention-keep-last` together with the new ones.
 - To restore: `gunzip -c backup-….sql.gz` or `zstd -dc backup-….sql.zst`.
 
 Typical commands:
@@ -262,8 +269,9 @@ Select it with `--storage=ftp` or `--storage=s3`. Files are stored as
 After each run, for `<root>/<folder>`, the same way as the DAG's pruner:
 
 1. every file whose name does **not** end with a suffix of the target is
-   deleted. The suffixes are `<ext>.gz` and `<ext>.zst`, whichever codec is
-   selected now, or only `<ext>` if it already ends in `.gz` or `.zst`;
+   deleted. The suffixes are `<ext>`, `<ext>.gz` and `<ext>.zst`, whichever
+   codec is selected now, or only `<ext>` if it already ends in `.gz` or
+   `.zst`;
 2. the remaining files are sorted by name (the fixed-width timestamp makes
    this chronological) and the oldest are deleted until
    `oap/backup-retention-keep-last` remain.
@@ -519,6 +527,7 @@ Deployment notes:
 | `lightad.io/schedule` (`@hourly` / `@daily` only) | `oap/backup-schedule` (any cron, optional) |
 | `lightad.io/file-folder` | `oap/backup-file-folder` |
 | `lightad.io/file-extension` | `oap/backup-file-extension` |
+| *(always gzip)* | `oap/backup-compression: gzip` |
 | `lightad.io/retention-keep-last` | `oap/backup-retention-keep-last` |
 | `lightad.io/container` | `oap/backup-container` |
 | `lightad.io/external-container-image` | `oap/backup-external-container-image` |
@@ -535,8 +544,14 @@ Behaviour differences:
   pull secrets and security context.
 - `retention-keep-last` must be ≥ 1.
 
-File names and storage layout are unchanged, so existing backups are pruned
-as before.
+- The DAG always gzipped the output. oap-backup compresses only when asked:
+  **add `oap/backup-compression: gzip` to every migrated pod** whose extension
+  does not already end in `.gz`. Without it the backups are stored
+  uncompressed, as `backup-<timestamp><ext>` instead of
+  `backup-<timestamp><ext>.gz`.
+
+With that annotation, file names and storage layout are unchanged, so
+existing backups are pruned as before.
 
 ## Limitations
 

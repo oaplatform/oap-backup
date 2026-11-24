@@ -29,23 +29,27 @@ const (
 	CompressionLevel  = "oap/backup-compression-level"
 )
 
-// Compression codecs (values of the Compression annotation).
+// Compression codecs (values of the Compression annotation). None, the
+// default, stores the command output as is.
 const (
+	None = "none"
 	Gzip = "gzip"
 	Zstd = "zstd"
 )
 
 // codecs describes every supported codec: the file suffix it appends and the
-// compression levels it accepts.
+// compression levels it accepts (none for None).
 var codecs = map[string]struct {
 	suffix             string
 	minLevel, maxLevel int
 }{
+	None: {},
 	Gzip: {".gz", 1, 9},
 	Zstd: {".zst", 1, 22},
 }
 
-// codecSuffixes lists the suffixes of all codecs, in a fixed order.
+// codecSuffixes lists the suffixes of the compressing codecs, in a fixed
+// order.
 var codecSuffixes = []string{codecs[Gzip].suffix, codecs[Zstd].suffix}
 
 // PartPlaceholder is replaced by the part id in the backup command of a
@@ -91,7 +95,7 @@ type Target struct {
 	Parts        bool
 	PartsCommand string
 	// Compression is the codec oap-backup compresses the command output
-	// with: Gzip (also when empty) or Zstd. It is not used when the
+	// with: None (also when empty), Gzip or Zstd. It is not used when the
 	// extension says the output is already compressed.
 	Compression string
 	// CompressionLevel is the codec's level; 0 selects the codec's default.
@@ -116,13 +120,11 @@ func (t Target) Precompressed() bool {
 }
 
 // Codec is the codec oap-backup must compress the command output with: Gzip
-// or Zstd, or "" when the output is stored as is.
+// or Zstd, or "" when the output is stored as is (Compression is None or
+// empty, or the output is already compressed).
 func (t Target) Codec() string {
-	switch {
-	case t.Precompressed():
+	if t.Precompressed() || t.Compression == None {
 		return ""
-	case t.Compression == "":
-		return Gzip
 	}
 	return t.Compression
 }
@@ -132,14 +134,15 @@ func (t Target) Suffix() string {
 	return t.FileExtension + codecs[t.Codec()].suffix
 }
 
-// Suffixes lists the suffixes of this target's backup files under any codec.
-// Besides Suffix it covers backups made before the Compression annotation
-// was changed, so they stay subject to retention instead of being foreign.
+// Suffixes lists the suffixes of this target's backup files under any codec:
+// the plain extension (None) and one per compressing codec. Besides Suffix
+// it covers backups made before the Compression annotation was changed, so
+// they stay subject to retention instead of being foreign.
 func (t Target) Suffixes() []string {
+	out := []string{t.FileExtension}
 	if t.Precompressed() {
-		return []string{t.FileExtension}
+		return out
 	}
-	out := make([]string, 0, len(codecSuffixes))
 	for _, suffix := range codecSuffixes {
 		out = append(out, t.FileExtension+suffix)
 	}
@@ -316,14 +319,18 @@ func Parse(pod *corev1.Pod, defaultSchedule string) (target Target, ok bool, err
 
 	compression := strings.ToLower(strings.TrimSpace(ann[Compression]))
 	if compression == "" {
-		compression = Gzip
+		compression = None
 	}
 	codec, known := codecs[compression]
 	if !known {
-		return Target{}, true, fmt.Errorf("annotation %s: %q must be %s or %s", Compression, ann[Compression], Gzip, Zstd)
+		return Target{}, true, fmt.Errorf("annotation %s: %q must be %s, %s or %s", Compression, ann[Compression], None, Gzip, Zstd)
 	}
 	level := 0
 	if raw := strings.TrimSpace(ann[CompressionLevel]); raw != "" {
+		if compression == None {
+			// Ignoring the level would hide a forgotten or misspelt codec.
+			return Target{}, true, fmt.Errorf("annotation %s: requires %s %s or %s", CompressionLevel, Compression, Gzip, Zstd)
+		}
 		level, err = strconv.Atoi(raw)
 		if err != nil || level < codec.minLevel || level > codec.maxLevel {
 			return Target{}, true, fmt.Errorf("annotation %s: %q must be an integer from %d to %d for %s",

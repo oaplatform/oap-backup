@@ -164,8 +164,11 @@ func mode(t annotations.Target) string {
 
 func compression(t annotations.Target) string {
 	codec := t.Codec()
-	if codec == "" {
+	switch {
+	case codec == "" && t.Precompressed():
 		return "none (the command output is already compressed)"
+	case codec == "":
+		return "none"
 	}
 	if t.CompressionLevel == 0 {
 		return codec + " (default level)"

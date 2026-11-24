@@ -72,6 +72,7 @@ func pod(name string, extra map[string]string) *corev1.Pod {
 		annotations.FileExtension:     ".sql",
 		annotations.RetentionKeepLast: "3",
 		annotations.Schedule:          "0 */6 * * *",
+		annotations.Compression:       "gzip",
 	}
 	for k, v := range extra {
 		if v == "" {

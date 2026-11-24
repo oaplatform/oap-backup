@@ -174,6 +174,7 @@ func target(ext string) annotations.Target {
 	return annotations.Target{
 		Namespace: "db", Pod: "pg-0", Container: "postgres", Command: "pg_dumpall",
 		FileFolder: "postgres", FileExtension: ext, RetentionKeepLast: 2, Schedule: "@daily",
+		Compression: annotations.Gzip,
 	}
 }
 
@@ -274,7 +275,9 @@ func TestPrune(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	if want := []string{"backup-20261103000000.sql.gz", "backup-20261104000000.sql.gz"}; !reflect.DeepEqual(res.Kept, want) {
+	// The uncompressed file is a backup too (made without a codec), and it is
+	// the newest one.
+	if want := []string{"backup-20261104000000.sql.gz", "backup-20261105000000.sql"}; !reflect.DeepEqual(res.Kept, want) {
 		t.Errorf("kept = %v, want %v", res.Kept, want)
 	}
 	if len(res.Deleted) != 4 {
@@ -388,5 +391,31 @@ func TestRunPrecompressedZstd(t *testing.T) {
 	}
 	if got := string(st.files["postgres"]["backup-20261110013000.tar.zst"]); got != "raw-zst-bytes" {
 		t.Errorf("content = %q, want stored as-is", got)
+	}
+}
+
+func TestRunNoCompression(t *testing.T) {
+	dump := strings.Repeat("dump-data ", 100)
+	for name, compression := range map[string]string{"zero value": "", "none": annotations.None} {
+		t.Run(name, func(t *testing.T) {
+			ex, st := &fakeExec{stdout: dump}, newMem()
+			// Backups made while the pod still had a codec stay and count.
+			st.files["postgres"] = map[string][]byte{
+				"backup-20261101000000.sql.gz":  nil,
+				"backup-20261102000000.sql.zst": nil,
+			}
+			tg := target(".sql")
+			tg.Compression = compression
+			if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			want := []string{"backup-20261102000000.sql.zst", "backup-20261110013000.sql"}
+			if got := st.names("postgres"); !reflect.DeepEqual(got, want) {
+				t.Fatalf("files = %v, want %v", got, want)
+			}
+			if got := string(st.files["postgres"]["backup-20261110013000.sql"]); got != dump {
+				t.Errorf("stored %d bytes, want the %d-byte dump as is", len(got), len(dump))
+			}
+		})
 	}
 }

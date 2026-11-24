@@ -29,6 +29,9 @@ const ServerEnv = "OAP_BACKUP_SERVER"
 
 const defaultServer = "http://localhost:9090"
 
+// Usage describes the CLI commands.
+const Usage = usage
+
 const usage = `Usage:
   oap-backup list [-o table|json]
       Backups that oap-backup detected: every pod with oap/backup-command,
@@ -47,7 +50,7 @@ Common flags:
   --server URL   address of the oap-backup service
                  (default $` + ServerEnv + `, else ` + defaultServer + `)
 
-Without a subcommand, oap-backup runs the service; see oap-backup --help.
+Without a command, oap-backup runs the service; see oap-backup --help.
 `
 
 // IsCommand reports whether arg is a CLI subcommand (as opposed to a flag of

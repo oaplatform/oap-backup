@@ -280,6 +280,8 @@ folders whose name is not a valid part id are not touched.
 
 ## Flags
 
+These are the flags of the service. `oap-backup --help` prints them too.
+
 | Flag | Default | Description |
 |---|---|---|
 | `--refresh` | `60s` | How often pods are re-listed and schedules reconciled. |
@@ -333,7 +335,7 @@ oapb run db/postgres-0 --wait      # back up this pod now
 | `describe <namespace>/<pod> [-o table\|json]` | The parsed annotations, next run, last run (trigger, start, duration, uploaded files and size, error), and the storage: every file in the backup folder with its backup time and size, newest first. For [partitioned backups](#partitioned-backups): the same for every part folder. Files that the next retention run deletes are marked. |
 | `run <namespace>/<pod> [--wait] [--timeout <duration>]` | Start a backup of the pod now. It fails if the pod is not scheduled or its backup is already running. |
 | `run --all [--wait] [--timeout <duration>]` | Start a backup of every scheduled pod that is not running one. |
-| `help` | Print the usage. |
+| `help`, `-h`, `--help` | Print the help: the commands, and how to start the service with all its flags. Running the binary with no arguments prints it too, and exits with `2`. |
 
 - `--wait` waits until the started backups finish and prints each result.
   `--timeout` (e.g. `30m`) limits the wait. The backup itself keeps running

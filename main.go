@@ -10,7 +10,9 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,17 +40,67 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && cli.IsCommand(os.Args[1]) {
-		os.Exit(cli.New(os.Getenv, os.Stdout, os.Stderr).Run(os.Args[1:]))
+	args := os.Args[1:]
+	switch {
+	case len(args) == 0:
+		// The service cannot start without storage flags, so this is a
+		// usage error in either role. A non-zero exit also keeps a
+		// Deployment that lost its args failing visibly.
+		writeHelp(os.Stderr)
+		os.Exit(2)
+	case helpRequested(args):
+		writeHelp(os.Stdout)
+	case cli.IsCommand(args[0]):
+		os.Exit(cli.New(os.Getenv, os.Stdout, os.Stderr).Run(args))
+	default:
+		serve(args)
 	}
-	serve()
 }
 
-// serve runs the oap-backup service until it is signalled to stop.
-func serve() {
-	cfg, err := config.Load(os.Args[1:], os.Getenv)
+// helpRequested reports whether the first argument asks for the general help.
+func helpRequested(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "-h", "-help", "--help":
+		return true
+	}
+	return false
+}
+
+// writeHelp prints the help of both roles of the binary: the CLI commands
+// and the service with its flags.
+func writeHelp(w io.Writer) {
+	fmt.Fprint(w, "oap-backup backs up Kubernetes pods that are annotated with oap/backup-*.\n")
+	fmt.Fprint(w, "The commands below talk to a running oap-backup service.\n\n")
+	fmt.Fprint(w, cli.Usage)
+	fmt.Fprint(w, `
+Service (this is what the Deployment runs):
+  oap-backup --storage=ftp --ftp_addr=<host:port> [flags]
+  oap-backup --storage=s3 --s3_endpoint=<host[:port]> --s3_bucket=<bucket> [flags]
+
+Service flags:
+`)
+	config.Usage(w)
+	fmt.Fprintf(w, `
+Environment:
+  %s                   FTP password
+  %s, %s   S3 static credentials
+  %s              default --server of the commands
+`, config.EnvFTPPassword, config.EnvS3AccessKey, config.EnvS3SecretKey, cli.ServerEnv)
+}
+
+// serve runs the oap-backup service with the flags args until it is
+// signalled to stop.
+func serve(args []string) {
+	cfg, err := config.Load(args, os.Getenv)
+	if errors.Is(err, flag.ErrHelp) {
+		writeHelp(os.Stdout)
+		return
+	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "oap-backup:", err)
+		fmt.Fprintf(os.Stderr, "oap-backup: %v\nRun 'oap-backup --help' for usage.\n", err)
 		os.Exit(2)
 	}
 

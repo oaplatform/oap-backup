@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"errors"
+	"flag"
 	"strings"
 	"testing"
 	"time"
@@ -72,5 +75,34 @@ func TestLoadErrors(t *testing.T) {
 				t.Fatalf("Load(%s) succeeded, want error", strings.Join(args, " "))
 			}
 		})
+	}
+}
+
+func TestUsage(t *testing.T) {
+	var buf bytes.Buffer
+	Usage(&buf)
+	out := buf.String()
+	for _, want := range []string{
+		"--ftp_addr string", "--s3_endpoint string", "--storage string", "(default ftp)",
+		"--backup_timeout duration", "(default 1h0m0s)", "--ftp_tls ", "--metrics_port int", "(default 9090)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("usage does not contain %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "(default false)") || strings.Contains(out, "  -ftp") {
+		t.Errorf("usage must not show false defaults or single-dash flags:\n%s", out)
+	}
+	// Sorted by name.
+	if strings.Index(out, "--backup_timeout") > strings.Index(out, "--tmp_dir") {
+		t.Errorf("usage is not sorted:\n%s", out)
+	}
+}
+
+func TestLoadHelp(t *testing.T) {
+	for _, arg := range []string{"-h", "--help"} {
+		if _, err := Load([]string{"--storage=s3", arg}, env(nil)); !errors.Is(err, flag.ErrHelp) {
+			t.Errorf("Load(%s) err = %v, want flag.ErrHelp", arg, err)
+		}
 	}
 }

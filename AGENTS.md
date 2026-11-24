@@ -13,7 +13,7 @@ schedule taken from the `oap/backup-schedule` annotation. Uses `k8s.io/client-go
 
 ## Architecture
 
-- `main.go` — dispatch: `list`/`describe`/`run`/`help` as first argument → `internal/cli`, anything else → `serve()`: flag parsing, logger, k8s client (in-cluster, kubeconfig fallback), storage factory, orphan helper-pod cleanup, HTTP server, signal-driven graceful shutdown.
+- `main.go` — dispatch: no arguments → help on stderr, exit 2; `help`/`-h`/`--help` → `writeHelp` (CLI commands + service flags from `config.Usage`); `list`/`describe`/`run` → `internal/cli`; anything else → `serve()`: flag parsing, logger, k8s client (in-cluster, kubeconfig fallback), storage factory, orphan helper-pod cleanup, HTTP server, signal-driven graceful shutdown.
 - `internal/api` — HTTP API (`Server.Handler`): `/metrics`, `/healthz`, `GET /targets` (scheduled + invalid), `GET /targets/{namespace}/{pod}` (status + storage content via `backup.Runner.Inspect`), `POST /run` (404 unknown, 409 already running); response types shared with the CLI.
 - `internal/cli` — `App.Run(args)`: `list`, `describe <ns>/<pod>`, `run <ns>/<pod>|--all [--wait]`; thin HTTP client of the service (`--server` / `$OAP_BACKUP_SERVER` / `http://localhost:9090`), table or JSON output, exit codes 0/1/2. Tests run it against the real `api.Server` + `scheduler.Manager` with fakes.
 - `internal/config` — `Load(args, getenv)`: all flags + validation; secrets only from env (`FTP_PASSWORD`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`).

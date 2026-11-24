@@ -5,8 +5,10 @@ package config
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 )
 
@@ -79,11 +81,40 @@ type Config struct {
 // Load parses command-line arguments into a Config, returning an error for
 // malformed or inconsistent flags. args should not include the program name
 // (i.e. os.Args[1:]). getenv supplies secrets; pass os.Getenv in production.
+// It prints nothing; for -h / --help it returns flag.ErrHelp (see Usage).
 func Load(args []string, getenv func(string) string) (Config, error) {
+	return load(args, getenv, nil)
+}
+
+// Usage writes the service flags, one per line with type, description and
+// default, sorted by name.
+func Usage(w io.Writer) {
+	_, _ = load(nil, nil, func(fs *flag.FlagSet) {
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fs.VisitAll(func(f *flag.Flag) {
+			kind, usage := flag.UnquoteUsage(f)
+			name := "--" + f.Name
+			if kind != "" {
+				name += " " + kind
+			}
+			if f.DefValue != "" && f.DefValue != "false" {
+				usage += fmt.Sprintf(" (default %s)", f.DefValue)
+			}
+			fmt.Fprintf(tw, "  %s\t%s\n", name, usage)
+		})
+		_ = tw.Flush()
+	})
+}
+
+// load defines the flags and parses args. With describe set it instead
+// passes the defined flags to describe and returns, so that Load and Usage
+// share one list of flags and defaults.
+func load(args []string, getenv func(string) string, describe func(*flag.FlagSet)) (Config, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
 	fs := flag.NewFlagSet("oap-backup", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 
 	refresh := fs.Duration("refresh", 60*time.Second, "how often to re-list pods and reconcile backup schedules")
 	namespace := fs.String("namespace", "", "only discover pods in this namespace (default: all namespaces)")
@@ -115,6 +146,10 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	metricsPort := fs.Int("metrics_port", 9090, "TCP port for /metrics, /healthz and /run")
 	logLevel := fs.String("loglevel", "info", "log level: debug, info, warn, or error")
 
+	if describe != nil {
+		describe(fs)
+		return Config{}, nil
+	}
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}

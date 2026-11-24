@@ -19,6 +19,7 @@ import (
 
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/metrics"
+	"oap-backup/internal/progress"
 )
 
 type fakeRunner struct {
@@ -30,7 +31,9 @@ type fakeRunner struct {
 	err error
 }
 
-func (f *fakeRunner) Run(ctx context.Context, t annotations.Target) (RunResult, error) {
+func (f *fakeRunner) Run(ctx context.Context, t annotations.Target, tracker *progress.Tracker) (RunResult, error) {
+	tracker.StartUpload(4096)
+	tracker.AddUploaded(1024)
 	if f.block != nil {
 		select {
 		case <-f.block:
@@ -189,7 +192,14 @@ func TestTrigger(t *testing.T) {
 			t.Fatalf("status of running target = %+v", st)
 		}
 		if st.CurrentRun.Started != nil {
+			// What the backup has sent so far is part of its status.
+			if p := st.CurrentRun.Progress; p == nil || p.UploadedBytes != 1024 || p.FilesUploaded != 0 {
+				t.Fatalf("progress of the running backup = %+v, want 1024 bytes", p)
+			}
 			break
+		}
+		if st.CurrentRun.Progress != nil {
+			t.Fatalf("a backup that has not started has no progress: %+v", st.CurrentRun.Progress)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("backup did not start")

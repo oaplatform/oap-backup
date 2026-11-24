@@ -35,6 +35,7 @@ import (
 	"oap-backup/internal/config"
 	"oap-backup/internal/kube"
 	"oap-backup/internal/metrics"
+	"oap-backup/internal/progress"
 	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 	"oap-backup/internal/storage"
@@ -228,8 +229,8 @@ func serve(args []string) {
 // jobRunner adapts backup.Runner to scheduler.JobRunner.
 type jobRunner struct{ runner *backup.Runner }
 
-func (j jobRunner) Run(ctx context.Context, t annotations.Target) (scheduler.RunResult, error) {
-	res, err := j.runner.Run(ctx, t)
+func (j jobRunner) Run(ctx context.Context, t annotations.Target, tracker *progress.Tracker) (scheduler.RunResult, error) {
+	res, err := j.runner.Run(ctx, t, tracker)
 	return scheduler.RunResult{Files: res.Files, SizeBytes: res.SizeBytes}, err
 }
 

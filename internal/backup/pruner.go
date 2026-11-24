@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"oap-backup/internal/annotations"
+	"oap-backup/internal/storage"
 )
 
 // PruneResult lists what Prune deleted and kept.
@@ -55,9 +56,16 @@ func (r *Runner) pruneDir(ctx context.Context, t annotations.Target, dir string)
 	}
 
 	for _, name := range names {
-		if t.IsBackupFile(name) {
+		switch {
+		case t.IsBackupFile(name):
 			matching = append(matching, name)
-		} else {
+		case strings.HasSuffix(name, storage.TempSuffix):
+			// Left behind by an upload that did not finish (oap-backup was
+			// killed, the connection broke): worth a warning, since a backup
+			// did not make it to the storage.
+			log.Warn("found a temporary file of an interrupted upload, deleting it", "file", name)
+			del(name, "temporary file of an interrupted upload")
+		default:
 			del(name, "not a backup file (suffix "+suffixes+")")
 		}
 	}

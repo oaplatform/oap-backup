@@ -64,7 +64,7 @@ func TestRunCommandFromScript(t *testing.T) {
 	tg := target(".sql")
 	tg.Command = ""
 	tg.CommandFrom = backupScript
-	if _, err := r.Run(context.Background(), tg); err != nil {
+	if _, err := r.Run(context.Background(), tg, nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if want := []string{script}; !reflect.DeepEqual(ex.cmds, want) {
@@ -96,7 +96,7 @@ func TestRunScriptUnreadable(t *testing.T) {
 	tg := target(".sql")
 	tg.Command, tg.CommandFrom, tg.ExternalImage = "", backupScript, "postgres:17"
 
-	_, err := r.Run(context.Background(), tg)
+	_, err := r.Run(context.Background(), tg, nil)
 	if err == nil || !strings.Contains(err.Error(), "backup command: secret pg-secret/dump.sh not found") {
 		t.Fatalf("err = %v", err)
 	}
@@ -107,7 +107,7 @@ func TestRunScriptUnreadable(t *testing.T) {
 
 	// A target with a reference but no resolver configured.
 	r.Scripts = nil
-	if _, err := r.Run(context.Background(), tg); err == nil || !strings.Contains(err.Error(), "not configured") {
+	if _, err := r.Run(context.Background(), tg, nil); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Errorf("no resolver: err = %v", err)
 	}
 }
@@ -133,7 +133,7 @@ func TestRunPartsFromScripts(t *testing.T) {
 	tg := partsTarget()
 	tg.Command, tg.CommandFrom = "", backupScript
 	tg.PartsCommand, tg.PartsCommandFrom = "", partsScript
-	if _, err := r.Run(context.Background(), tg); err != nil {
+	if _, err := r.Run(context.Background(), tg, nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// Both scripts ran with their content; every {PART_ID} was replaced.
@@ -158,11 +158,99 @@ func TestRunPartsFromScripts(t *testing.T) {
 	scripts.scripts[backupScript] = "dump-everything"
 	ex.cmds, h.created = nil, nil
 	r.Retries = 0
-	_, err := r.Run(context.Background(), tg)
+	_, err := r.Run(context.Background(), tg, nil)
 	if err == nil || !strings.Contains(err.Error(), "backup command (secret pg-secret/dump.sh) must contain {PART_ID}") {
 		t.Fatalf("err = %v", err)
 	}
 	if len(ex.cmds) != 0 || len(h.created) != 0 {
 		t.Errorf("executed %v, helpers %v; want none", ex.cmds, h.created)
+	}
+}
+
+func TestLogSizesAreHumanReadable(t *testing.T) {
+	// 5000 bytes, stored as is: 4.9 KiB.
+	ex, st := &fakeExec{stdout: strings.Repeat("x", 5000)}, newMem()
+	r := newRunner(ex, st, &fakeHelpers{}, now)
+	log := withLog(r)
+	tg := target(".sql")
+	tg.Compression = annotations.None
+	if _, err := r.Run(context.Background(), tg, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := log.String()
+	for _, want := range []string{
+		`msg="backup file written" target=db/pg-0 folder=postgres file=backup-20261110013000.sql size="4.9 KiB"`,
+		`msg="backup complete" target=db/pg-0 folder=postgres file=backup-20261110013000.sql size="4.9 KiB"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log does not contain %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "size_bytes") {
+		t.Errorf("log still has size_bytes:\n%s", out)
+	}
+
+	// Parts: every part and the total.
+	ex = &fakeExec{handler: func(cmd string, stdout io.Writer) error {
+		if cmd == "list-parts" {
+			_, _ = io.WriteString(stdout, "a=20261105000000\nb=20261105000000\n")
+			return nil
+		}
+		_, _ = io.WriteString(stdout, strings.Repeat("x", 2048))
+		return nil
+	}}
+	r = newRunner(ex, newMem(), &fakeHelpers{}, now)
+	log = withLog(r)
+	ptg := partsTarget()
+	ptg.Compression = annotations.None
+	if _, err := r.Run(context.Background(), ptg, nil); err != nil {
+		t.Fatalf("Run(parts): %v", err)
+	}
+	out = log.String()
+	for _, want := range []string{
+		`msg="part backup complete" target=db/pg-0 folder=postgres part=a file=backup-20261105000000.sql size="2.0 KiB"`,
+		`msg="backup complete" target=db/pg-0 folder=postgres files=2 size="4.0 KiB"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log does not contain %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "size_bytes") {
+		t.Errorf("log still has size_bytes:\n%s", out)
+	}
+}
+
+func TestPruneWarnsAboutTemporaryFiles(t *testing.T) {
+	st := newMem()
+	st.files["postgres"] = map[string][]byte{
+		"backup-20261101000000.sql.gz":     nil,
+		"backup-20261102000000.sql.gz.tmp": nil, // interrupted upload
+		"notes.txt":                        nil,
+	}
+	r := newRunner(&fakeExec{}, st, &fakeHelpers{}, now)
+	log := withLog(r)
+	res, err := r.Prune(context.Background(), target(".sql"))
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if got := st.names("postgres"); !reflect.DeepEqual(got, []string{"backup-20261101000000.sql.gz"}) || len(res.Deleted) != 2 {
+		t.Errorf("files = %v, deleted = %v", got, res.Deleted)
+	}
+	out := log.String()
+	// A warning for the temporary file only; the foreign file is pruned as before.
+	if !strings.Contains(out, `level=WARN msg="found a temporary file of an interrupted upload, deleting it" target=db/pg-0 folder=postgres file=backup-20261102000000.sql.gz.tmp`) {
+		t.Errorf("no warning for the temporary file:\n%s", out)
+	}
+	if strings.Count(out, "level=WARN") != 1 {
+		t.Errorf("want exactly one warning:\n%s", out)
+	}
+
+	// A target whose own extension is .tmp: these are its backups.
+	st.files["postgres"] = map[string][]byte{"backup-20261101000000.tmp": nil}
+	log.Reset()
+	tg := target(".tmp")
+	tg.Compression = annotations.None
+	if res, err := r.Prune(context.Background(), tg); err != nil || len(res.Deleted) != 0 || strings.Contains(log.String(), "level=WARN") {
+		t.Errorf(".tmp extension: deleted = %v, err = %v, log:\n%s", res.Deleted, err, log.String())
 	}
 }

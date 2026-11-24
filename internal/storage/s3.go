@@ -46,11 +46,13 @@ func (s *S3) key(dir, name string) string {
 }
 
 // Upload implements Storage.
-func (s *S3) Upload(ctx context.Context, dir, name, localPath string) (string, error) {
+func (s *S3) Upload(ctx context.Context, dir, name, localPath string, progress func(n int64)) (string, error) {
 	key := s.key(dir, name)
-	_, err := s.client.FPutObject(ctx, s.cfg.Bucket, key, localPath, minio.PutObjectOptions{
-		ContentType: "application/octet-stream",
-	})
+	opts := minio.PutObjectOptions{ContentType: "application/octet-stream"}
+	if progress != nil {
+		opts.Progress = &progressReader{fn: progress}
+	}
+	_, err := s.client.FPutObject(ctx, s.cfg.Bucket, key, localPath, opts)
 	location := fmt.Sprintf("s3://%s/%s", s.cfg.Bucket, key)
 	if err != nil {
 		return location, fmt.Errorf("s3 put %s: %w", location, err)

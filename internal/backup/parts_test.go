@@ -15,6 +15,7 @@ import (
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/kube"
 	"oap-backup/internal/metrics"
+	"oap-backup/internal/progress"
 )
 
 func partsTarget() annotations.Target {
@@ -66,7 +67,7 @@ func TestRunParts(t *testing.T) {
 		return nil
 	}}
 
-	if _, err := newRunner(ex, st, h, now).Run(context.Background(), partsTarget()); err != nil {
+	if _, err := newRunner(ex, st, h, now).Run(context.Background(), partsTarget(), nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -141,7 +142,7 @@ func TestRunPartsRetryAfterPartFailure(t *testing.T) {
 		return nil
 	}}
 
-	if _, err := newRunner(ex, st, h, now).Run(context.Background(), partsTarget()); err != nil {
+	if _, err := newRunner(ex, st, h, now).Run(context.Background(), partsTarget(), nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	// The failed part does not stop the others; the retry backs up only it.
@@ -176,7 +177,7 @@ func TestRunPartsBadOutput(t *testing.T) {
 				_, _ = io.WriteString(stdout, output)
 				return nil
 			}}
-			_, err := newRunner(ex, st, h, now).Run(context.Background(), partsTarget())
+			_, err := newRunner(ex, st, h, now).Run(context.Background(), partsTarget(), nil)
 			if err == nil || !strings.Contains(err.Error(), "parts command output") {
 				t.Fatalf("err = %v, want parts command output error", err)
 			}
@@ -196,7 +197,7 @@ func TestRunPartsBadOutput(t *testing.T) {
 
 func TestRunPartsCommandFails(t *testing.T) {
 	ex := &fakeExec{handler: func(string, io.Writer) error { return &kube.ExitError{Code: 3} }}
-	_, err := newRunner(ex, newMem(), &fakeHelpers{}, now).Run(context.Background(), partsTarget())
+	_, err := newRunner(ex, newMem(), &fakeHelpers{}, now).Run(context.Background(), partsTarget(), nil)
 	if err == nil || !strings.Contains(err.Error(), "parts command exited with code 3") {
 		t.Fatalf("err = %v", err)
 	}
@@ -268,7 +269,7 @@ func TestRunPartsMetrics(t *testing.T) {
 	r := newRunner(ex, st, &fakeHelpers{}, now)
 	r.Retries = 0
 	r.Metrics = metrics.New()
-	if _, err := r.Run(context.Background(), partsTarget()); err == nil {
+	if _, err := r.Run(context.Background(), partsTarget(), nil); err == nil {
 		t.Fatal("want error: part b fails")
 	}
 
@@ -289,4 +290,35 @@ func TestRunPartsMetrics(t *testing.T) {
 	check("parts stored", testutil.ToFloat64(m.PartsStored.WithLabelValues("db", "postgres")), 2)
 	check("part folders pruned", testutil.ToFloat64(m.PartFoldersPruned.WithLabelValues("db", "postgres")), 1)
 	check("runs failed", testutil.ToFloat64(m.Runs.WithLabelValues("db", "postgres", metrics.ResultFailure)), 1)
+}
+
+func TestRunPartsTracksUploadedBytes(t *testing.T) {
+	ex := &fakeExec{handler: func(cmd string, stdout io.Writer) error {
+		if cmd == "list-parts" {
+			_, _ = io.WriteString(stdout, "a=20261105000000\nb=20261105000000\nc=SKIP\n")
+			return nil
+		}
+		_, _ = io.WriteString(stdout, strings.Repeat("x", 300))
+		return nil
+	}}
+	st := newMem()
+	tracker := progress.New()
+	var seen []progress.Snapshot
+	st.midUpload = func() {
+		snap, _ := tracker.Snapshot()
+		seen = append(seen, snap)
+	}
+	tg := partsTarget()
+	tg.Compression = annotations.None
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg, tracker); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// Half of part a; then all of a plus half of b.
+	want := []progress.Snapshot{{UploadedBytes: 150}, {UploadedBytes: 450, FilesUploaded: 1}}
+	if !reflect.DeepEqual(seen, want) {
+		t.Errorf("snapshots during the uploads = %+v, want %+v", seen, want)
+	}
+	if got, _ := tracker.Snapshot(); got != (progress.Snapshot{UploadedBytes: 600, FilesUploaded: 2}) {
+		t.Errorf("final snapshot = %+v, want 600 bytes, 2 files", got)
+	}
 }

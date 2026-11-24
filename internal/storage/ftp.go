@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/textproto"
 	"os"
@@ -36,13 +37,23 @@ func (f *FTP) remoteDir(dir string) string {
 	return path.Join("/", f.cfg.Folder, dir)
 }
 
-// Upload implements Storage.
-func (f *FTP) Upload(ctx context.Context, dir, name, localPath string) (string, error) {
+// TempSuffix is appended to the name of a file while FTP uploads it.
+const TempSuffix = ".tmp"
+
+// Upload implements Storage. The file is sent as <name>.tmp and renamed to
+// <name> only when it is complete, so a reader of the folder never takes a
+// half-uploaded file for a backup. A .tmp file left behind by an interrupted
+// upload is not a backup file; retention pruning deletes it.
+func (f *FTP) Upload(ctx context.Context, dir, name, localPath string, progress func(n int64)) (string, error) {
 	file, err := os.Open(localPath)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
+	var body io.Reader = file
+	if progress != nil {
+		body = &progressReader{r: file, fn: progress}
+	}
 
 	remoteDir := f.remoteDir(dir)
 	remotePath := path.Join(remoteDir, name)
@@ -50,8 +61,21 @@ func (f *FTP) Upload(ctx context.Context, dir, name, localPath string) (string, 
 		if err := ensureDir(c, remoteDir); err != nil {
 			return err
 		}
-		if err := c.Stor(remotePath, file); err != nil {
-			return fmt.Errorf("ftp STOR %s: %w", remotePath, err)
+		tempPath := remotePath + TempSuffix
+		if err := c.Stor(tempPath, body); err != nil {
+			// Best effort: the connection may already be gone.
+			_ = c.Delete(tempPath)
+			return fmt.Errorf("ftp STOR %s: %w", tempPath, err)
+		}
+		if err := c.Rename(tempPath, remotePath); err != nil {
+			// Some servers refuse to rename onto an existing file, which
+			// happens when the same backup is uploaded again.
+			if delErr := c.Delete(remotePath); delErr != nil {
+				return fmt.Errorf("ftp RNTO %s -> %s: %w", tempPath, remotePath, err)
+			}
+			if err := c.Rename(tempPath, remotePath); err != nil {
+				return fmt.Errorf("ftp RNTO %s -> %s: %w", tempPath, remotePath, err)
+			}
 		}
 		return nil
 	})

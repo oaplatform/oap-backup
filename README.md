@@ -308,7 +308,11 @@ Select it with `--storage=ftp` or `--storage=s3`. Files are stored as
 
 - **FTP**: the root is `--ftp_folder` (default `/`). The path is absolute on
   the server, so on servers that do not chroot users, point it at a writable
-  directory. Missing directories are created. Each operation uses its own
+  directory. Missing directories are created. A file is uploaded as
+  `<name>.tmp` and renamed to `<name>` when it is complete, so a file with a
+  backup name is always whole. A `.tmp` file left by an interrupted upload is
+  deleted by the next retention run, with a warning in the log. The FTP user needs the right to rename
+  (and to delete, also for retention). Each operation uses its own
   connection (passive mode). `--ftp_tls` enables explicit TLS (`AUTH TLS`),
   with TLS session reuse for data connections. The password is read from
   `$FTP_PASSWORD`.
@@ -396,7 +400,7 @@ oapb run db/postgres-0 --wait      # back up this pod now
 | Command | Description |
 |---|---|
 | `list [-o table\|json]` | Every pod with `oap/backup-command`: status (`scheduled` / `running`), mode (`single` / `parts`), schedule, time to the next run, result of the last run, folder. Pods skipped because of invalid annotations are listed below, with the error. |
-| `status [--lines <n>] [-o table\|json]` | What oap-backup is doing now: how many pods are scheduled, invalid and being backed up, the next scheduled run, and the pods whose last run failed. For every backup in progress: whether it is running (and for how long) or queued for a free slot (`--max_concurrent`), what triggered it, its settings, the previous run, and the last `--lines` (15) lines of its log. `--lines 0` hides the log. |
+| `status [--lines <n>] [-o table\|json]` | What oap-backup is doing now: how many pods are scheduled, invalid and being backed up, the next scheduled run, and the pods whose last run failed. For every backup in progress: whether it is running (and for how long) or queued for a free slot (`--max_concurrent`), what triggered it, how much data it has already sent to the backup storage, its settings, the previous run, and the last `--lines` (15) lines of its log. `--lines 0` hides the log. |
 | `describe <namespace>/<pod> [-o table\|json]` | The parsed annotations, next run, last run (trigger, start, duration, uploaded files and size, error), and the storage: every file in the backup folder with its backup time and size, newest first. For [partitioned backups](#partitioned-backups): the same for every part folder. Files that the next retention run deletes are marked. |
 | `refresh [-o table\|json]` | Rescan the pods now, without waiting for the next periodic scan (`--refresh`, 60s), and print the same list as `list`. Use it right after you changed a pod's `oap/backup-*` annotations. It fails if the Kubernetes API cannot be reached; the current schedules are then kept. |
 | `run <namespace>/<pod> [--wait] [--timeout <duration>]` | Start a backup of the pod now. It fails if the pod is not scheduled or its backup is already running. |
@@ -418,6 +422,11 @@ oapb run db/postgres-0 --wait      # back up this pod now
   the oap-backup pod. From your machine, use
   `kubectl -n oap-backup port-forward svc/oap-backup 9090:9090`, or run the
   image: `docker run --rm --network host oap-backup list`.
+- `Uploaded` in `status` is what the running backup has sent to the storage
+  so far, after compression. A backup is first written to `--tmp_dir` and
+  uploaded afterwards, so it stays at `0 B` while the backup command runs.
+  For a partitioned backup it is the total of all parts, with the number of
+  finished files. A retry uploads again, so it starts from zero.
 - "Last run" is kept in memory: it is empty after oap-backup restarts, and
   only covers runs since then. The files on the storage are always read live.
 - Without a subcommand, the binary runs the service.
@@ -438,6 +447,7 @@ Next run:  app/tenants-0 in 2h14m (schedule 0 */6 * * *)
 Backup in progress: db/postgres-0
   State:         running for 31s
   Trigger:       manual, at 2026-11-24 12:00:00 UTC
+  Uploaded:      300.0 MiB
   Mode:          single
   Container:     postgres
   Command:       pg_dumpall -U postgres
@@ -454,8 +464,8 @@ started backup of db/postgres-0
   12:00:00 INFO  backup triggered trigger=manual
   12:00:00 INFO  running backup command folder=db/postgres pod=postgres-0 container=postgres command="pg_dumpall -U postgres" dir=db/postgres file=backup-20261124120000.sql.zst
   12:00:31 INFO  backup command stderr folder=db/postgres pod=postgres-0 line="pg_dumpall: dumping database \"app\""
-  12:00:40 INFO  backup file written folder=db/postgres file=backup-20261124120000.sql.zst size_bytes=124151398
-  12:00:42 INFO  backup complete folder=db/postgres file=backup-20261124120000.sql.zst size_bytes=124151398 location=s3://backups/prod/db/postgres/backup-20261124120000.sql.zst duration=42s
+  12:00:40 INFO  backup file written folder=db/postgres file=backup-20261124120000.sql.zst size="118.4 MiB"
+  12:00:42 INFO  backup complete folder=db/postgres file=backup-20261124120000.sql.zst size="118.4 MiB" location=s3://backups/prod/db/postgres/backup-20261124120000.sql.zst duration=42s
   12:00:42 INFO  pruned file folder=db/postgres file=backup-20261122120000.sql.zst reason=retention_keep_last=8
   12:00:42 INFO  prune complete folder=db/postgres deleted=1 kept=8
 db/postgres-0: ok in 42s, 1 file, 118.4 MiB uploaded
@@ -489,7 +499,7 @@ Served on `--metrics_port` (9090):
 |---|---|
 | `GET /metrics` | Prometheus metrics. |
 | `GET /healthz` | Liveness/readiness, returns `ok`. |
-| `GET /targets` | `{"targets": [...], "invalid": [...]}`. `targets`: scheduled pods with parsed annotations, `next_run`, `running`, `current_run` (trigger, `triggered`, `started`; while a backup is in progress) and `last_run`. `invalid`: pods skipped because of their annotations, with the error. |
+| `GET /targets` | `{"targets": [...], "invalid": [...]}`. `targets`: scheduled pods with parsed annotations, `next_run`, `running`, `current_run` (trigger, `triggered`, `started`, and `progress` with `uploaded_bytes` and `files_uploaded`; while a backup is in progress) and `last_run`. `invalid`: pods skipped because of their annotations, with the error. |
 | `GET /targets/<namespace>/<pod>` | One scheduled pod, as in `/targets`, plus `storage`: its location and the files of the backup folder (or of every part folder). If the storage cannot be read, `storage.error` is set. `404` if the pod is not scheduled. |
 | `POST /run?target=<namespace>/<pod>` | Start a backup of one pod now (replaces the DAG's `force` param). Returns `202 {"started": [...]}`, `404` if the pod is not scheduled, or `409` if its backup is already running. |
 | `POST /run` | Start a backup of **every** scheduled pod that is not running one. |

@@ -8,6 +8,7 @@ import (
 
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/api"
+	"oap-backup/internal/progress"
 	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 )
@@ -27,7 +28,8 @@ func TestRenderStatusQueuedAndRunning(t *testing.T) {
 		Scheduled: 2,
 		InProgress: []InProgress{
 			{TargetStatus: scheduler.TargetStatus{Target: target("a"), Running: true,
-				CurrentRun: &scheduler.CurrentRun{Trigger: "schedule", Triggered: now.Add(-45 * time.Second), Started: &started}}, Log: lines},
+				CurrentRun: &scheduler.CurrentRun{Trigger: "schedule", Triggered: now.Add(-45 * time.Second), Started: &started,
+					Progress: &progress.Snapshot{UploadedBytes: 5 << 30, FilesUploaded: 3}}}, Log: lines},
 			{TargetStatus: scheduler.TargetStatus{Target: target("b"), Running: true,
 				CurrentRun: &scheduler.CurrentRun{Trigger: "manual", Triggered: now.Add(-5 * time.Second)}}},
 		},
@@ -38,6 +40,7 @@ func TestRenderStatusQueuedAndRunning(t *testing.T) {
 	for _, want := range []string{
 		"2 scheduled, 0 invalid, 2 in progress",
 		"Backup in progress: db/a", "running for 40s", "schedule, at 2026-11-24 11:59:15 UTC",
+		"Uploaded:", "5.0 GiB (3 files done)",
 		"Log (last 3 of 4 lines):", "INFO  line b", "INFO  line d",
 		"Backup in progress: db/b", "queued for 5s, waiting for a free slot", "Log: no lines yet",
 	} {
@@ -47,6 +50,10 @@ func TestRenderStatusQueuedAndRunning(t *testing.T) {
 	}
 	if strings.Contains(out, "line a") {
 		t.Errorf("only the last 3 lines are expected:\n%s", out)
+	}
+	// The queued backup has sent nothing and shows no Uploaded row.
+	if strings.Count(out, "Uploaded:") != 1 {
+		t.Errorf("want one Uploaded row, for the running backup:\n%s", out)
 	}
 }
 
@@ -65,24 +72,6 @@ func TestShortDuration(t *testing.T) {
 	for d, want := range cases {
 		if got := shortDuration(d); got != want {
 			t.Errorf("shortDuration(%s) = %q, want %q", d, got, want)
-		}
-	}
-}
-
-func TestHumanSize(t *testing.T) {
-	cases := map[int64]string{
-		0:              "0 B",
-		1023:           "1023 B",
-		1024:           "1.0 KiB",
-		1536:           "1.5 KiB",
-		3 << 20:        "3.0 MiB",
-		5 << 30:        "5.0 GiB",
-		2 << 40:        "2.0 TiB",
-		3000 * 1 << 40: "3000.0 TiB",
-	}
-	for n, want := range cases {
-		if got := humanSize(n); got != want {
-			t.Errorf("humanSize(%d) = %q, want %q", n, got, want)
 		}
 	}
 }

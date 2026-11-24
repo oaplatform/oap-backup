@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"oap-backup/internal/annotations"
+	"oap-backup/internal/humanize"
 	"oap-backup/internal/kube"
 	"oap-backup/internal/metrics"
 )
@@ -165,7 +166,7 @@ func (r *Runner) partsAttempt(ctx context.Context, t annotations.Target, log *sl
 		if r.Metrics != nil {
 			r.Metrics.PartBackups.WithLabelValues(t.Namespace, t.FileFolder, metrics.ResultSuccess).Inc()
 		}
-		log.Info("part backup complete", "part", p.ID, "file", res.FileName, "size_bytes", res.SizeBytes,
+		log.Info("part backup complete", "part", p.ID, "file", res.FileName, "size", humanize.Bytes(res.SizeBytes),
 			"location", res.Location)
 		total.SizeBytes += res.SizeBytes
 		total.Files++

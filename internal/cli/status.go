@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"oap-backup/internal/api"
+	"oap-backup/internal/humanize"
 	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 )
@@ -139,6 +140,13 @@ func renderInProgress(w io.Writer, p InProgress, lines int, now time.Time) {
 				shortDuration(now.Sub(cur.Triggered))))
 		}
 		row("Trigger", fmt.Sprintf("%s, at %s", cur.Trigger, cur.Triggered.Format(timeLayout)))
+		if p := cur.Progress; p != nil {
+			uploaded := humanize.Bytes(p.UploadedBytes)
+			if p.FilesUploaded > 0 {
+				uploaded += fmt.Sprintf(" (%s done)", plural(p.FilesUploaded, "file"))
+			}
+			row("Uploaded", uploaded)
+		}
 	} else {
 		row("State", "running")
 	}

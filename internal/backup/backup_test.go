@@ -20,6 +20,7 @@ import (
 
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/kube"
+	"oap-backup/internal/progress"
 	"oap-backup/internal/storage"
 )
 
@@ -62,16 +63,40 @@ type memStorage struct {
 	mu      sync.Mutex
 	files   map[string]map[string][]byte
 	failDel map[string]bool
+	// midUpload, when set, is called after half of a file was reported as
+	// sent.
+	midUpload func()
+	// failUpload fails the upload of these file names after half of the
+	// file was sent, once each.
+	failUpload map[string]bool
 }
 
 func newMem() *memStorage {
 	return &memStorage{files: map[string]map[string][]byte{}, failDel: map[string]bool{}}
 }
 
-func (m *memStorage) Upload(_ context.Context, dir, name, local string) (string, error) {
+func (m *memStorage) Upload(_ context.Context, dir, name, local string, progress func(n int64)) (string, error) {
 	data, err := os.ReadFile(local)
 	if err != nil {
 		return "", err
+	}
+	// Like a real store, report the upload in pieces.
+	half := int64(len(data) / 2)
+	if progress != nil {
+		progress(half)
+	}
+	if m.midUpload != nil {
+		m.midUpload()
+	}
+	m.mu.Lock()
+	fail := m.failUpload[name]
+	delete(m.failUpload, name)
+	m.mu.Unlock()
+	if fail {
+		return "", errors.New("connection reset")
+	}
+	if progress != nil {
+		progress(int64(len(data)) - half)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -182,7 +207,7 @@ var now = time.Date(2026, 11, 10, 1, 30, 0, 0, time.UTC)
 
 func TestRunGzipsAndUploads(t *testing.T) {
 	ex, st, h := &fakeExec{stdout: "dump-data"}, newMem(), &fakeHelpers{}
-	if _, err := newRunner(ex, st, h, now).Run(context.Background(), target(".sql")); err != nil {
+	if _, err := newRunner(ex, st, h, now).Run(context.Background(), target(".sql"), nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	data := st.files["postgres"]["backup-20261110013000.sql.gz"]
@@ -204,7 +229,7 @@ func TestRunGzipsAndUploads(t *testing.T) {
 
 func TestRunAlreadyGzipped(t *testing.T) {
 	ex, st := &fakeExec{stdout: "raw-gz-bytes"}, newMem()
-	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".archive.gz")); err != nil {
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".archive.gz"), nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := string(st.files["postgres"]["backup-20261110013000.archive.gz"]); got != "raw-gz-bytes" {
@@ -217,7 +242,7 @@ func TestRunHelperPodAndRetries(t *testing.T) {
 	st, h := newMem(), &fakeHelpers{}
 	tg := target(".sql")
 	tg.ExternalImage = "postgres:17"
-	if _, err := newRunner(ex, st, h, now).Run(context.Background(), tg); err != nil {
+	if _, err := newRunner(ex, st, h, now).Run(context.Background(), tg, nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if len(ex.calls) != 3 {
@@ -245,7 +270,7 @@ func TestRunFailsAfterRetriesButStillPrunes(t *testing.T) {
 		"backup-20261102000000.sql.gz": nil,
 		"backup-20261103000000.sql.gz": nil,
 	}
-	_, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".sql"))
+	_, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".sql"), nil)
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -337,7 +362,7 @@ func TestRunZstd(t *testing.T) {
 	tg := target(".sql")
 	tg.Compression = annotations.Zstd
 	tg.CompressionLevel = 19
-	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg); err != nil {
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg, nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	want := []string{"backup-20261102000000.sql.gz", "backup-20261110013000.sql.zst"}
@@ -366,7 +391,7 @@ func TestRunGzipLevel(t *testing.T) {
 		ex, st := &fakeExec{stdout: dump}, newMem()
 		tg := target(".sql")
 		tg.CompressionLevel = level
-		if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg); err != nil {
+		if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg, nil); err != nil {
 			t.Fatalf("level %d: Run: %v", level, err)
 		}
 		data := st.files["postgres"]["backup-20261110013000.sql.gz"]
@@ -386,7 +411,7 @@ func TestRunGzipLevel(t *testing.T) {
 
 func TestRunPrecompressedZstd(t *testing.T) {
 	ex, st := &fakeExec{stdout: "raw-zst-bytes"}, newMem()
-	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".tar.zst")); err != nil {
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), target(".tar.zst"), nil); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := string(st.files["postgres"]["backup-20261110013000.tar.zst"]); got != "raw-zst-bytes" {
@@ -406,7 +431,7 @@ func TestRunNoCompression(t *testing.T) {
 			}
 			tg := target(".sql")
 			tg.Compression = compression
-			if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg); err != nil {
+			if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg, nil); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
 			want := []string{"backup-20261102000000.sql.zst", "backup-20261110013000.sql"}
@@ -417,5 +442,29 @@ func TestRunNoCompression(t *testing.T) {
 				t.Errorf("stored %d bytes, want the %d-byte dump as is", len(got), len(dump))
 			}
 		})
+	}
+}
+
+func TestRunTracksUploadedBytes(t *testing.T) {
+	dump := strings.Repeat("x", 1000)
+	ex, st := &fakeExec{stdout: dump}, newMem()
+	tracker := progress.New()
+	// Seen from the middle of the upload: half of the file is on the storage.
+	var mid progress.Snapshot
+	st.midUpload = func() { mid, _ = tracker.Snapshot() }
+	// The first attempt loses the connection after half of the file.
+	st.failUpload = map[string]bool{"backup-20261110013000.sql": true}
+
+	tg := target(".sql")
+	tg.Compression = annotations.None
+	if _, err := newRunner(ex, st, &fakeHelpers{}, now).Run(context.Background(), tg, tracker); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if mid != (progress.Snapshot{UploadedBytes: 500}) {
+		t.Errorf("mid-upload snapshot = %+v, want 500 bytes, 0 files", mid)
+	}
+	// The retry starts from zero, so the failed half is not counted twice.
+	if got, _ := tracker.Snapshot(); got != (progress.Snapshot{UploadedBytes: 1000, FilesUploaded: 1}) {
+		t.Errorf("final snapshot = %+v, want 1000 bytes, 1 file", got)
 	}
 }

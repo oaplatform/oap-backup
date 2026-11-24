@@ -5,6 +5,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"oap-backup/internal/config"
@@ -22,9 +23,12 @@ type File struct {
 // <root>/<dir>/<name>. dir is a backup target's file folder (slash
 // separated, without leading or trailing slashes).
 type Storage interface {
+	// progress, if not nil, is called while the file is being sent, each
+	// time with the number of bytes sent since the previous call.
+	//
 	// Upload stores the local file localPath as <root>/<dir>/<name>,
 	// creating dir if needed, and returns a printable remote location.
-	Upload(ctx context.Context, dir, name, localPath string) (string, error)
+	Upload(ctx context.Context, dir, name, localPath string, progress func(n int64)) (string, error)
 	// List returns the base names of the files directly inside <root>/<dir>.
 	// A missing or unreadable dir yields an empty list and no error.
 	List(ctx context.Context, dir string) ([]string, error)
@@ -51,4 +55,25 @@ func New(cfg config.Config) (Storage, error) {
 	default:
 		return nil, fmt.Errorf("unsupported storage %q", cfg.Storage)
 	}
+}
+
+// progressReader reports what is read through it to fn. It serves both as a
+// wrapper around the uploaded file (FTP) and as the bare progress hook of
+// minio-go (S3), which calls Read with a buffer as long as the data it sent.
+type progressReader struct {
+	// r is the wrapped reader; nil for a bare hook.
+	r  io.Reader
+	fn func(n int64)
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n := len(b)
+	var err error
+	if p.r != nil {
+		n, err = p.r.Read(b)
+	}
+	if n > 0 {
+		p.fn(int64(n))
+	}
+	return n, err
 }

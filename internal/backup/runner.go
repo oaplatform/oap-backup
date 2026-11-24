@@ -15,8 +15,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"oap-backup/internal/annotations"
+	"oap-backup/internal/humanize"
 	"oap-backup/internal/kube"
 	"oap-backup/internal/metrics"
+	"oap-backup/internal/progress"
 	"oap-backup/internal/storage"
 )
 
@@ -79,15 +81,22 @@ func (r *Runner) now() time.Time {
 // folder and prunes each part folder; see partsAttempt.
 //
 // The Result describes what the backup uploaded, also when pruning failed.
-func (r *Runner) Run(ctx context.Context, t annotations.Target) (Result, error) {
+//
+// tracker, which may be nil, follows how much the run has sent to the
+// storage. It starts again with every attempt, since a retry uploads again.
+func (r *Runner) Run(ctx context.Context, t annotations.Target, tracker *progress.Tracker) (Result, error) {
 	log := r.Logger.With("target", t.Key(), "folder", t.FileFolder)
 	start := r.now()
+	ctx = progress.NewContext(ctx, tracker)
 
 	attempt := r.attempt
 	if t.Parts {
 		attempt = r.partsAttempt
 	}
-	res, backupErr := r.withRetries(ctx, log, func() (Result, error) { return attempt(ctx, t, log) })
+	res, backupErr := r.withRetries(ctx, log, func() (Result, error) {
+		tracker.Reset()
+		return attempt(ctx, t, log)
+	})
 
 	duration := r.now().Sub(start)
 	if r.Metrics != nil {
@@ -100,10 +109,10 @@ func (r *Runner) Run(ctx context.Context, t annotations.Target) (Result, error) 
 		}
 	} else {
 		if t.Parts {
-			log.Info("backup complete", "files", res.Files, "size_bytes", res.SizeBytes,
+			log.Info("backup complete", "files", res.Files, "size", humanize.Bytes(res.SizeBytes),
 				"duration", duration.Round(time.Millisecond))
 		} else {
-			log.Info("backup complete", "file", res.FileName, "size_bytes", res.SizeBytes,
+			log.Info("backup complete", "file", res.FileName, "size", humanize.Bytes(res.SizeBytes),
 				"location", res.Location, "duration", duration.Round(time.Millisecond))
 		}
 		if r.Metrics != nil {
@@ -272,12 +281,15 @@ func (r *Runner) backupTo(ctx context.Context, t annotations.Target, dir, name, 
 	if err != nil {
 		return Result{}, err
 	}
-	log.Info("backup file written", "file", name, "size_bytes", info.Size())
+	log.Info("backup file written", "file", name, "size", humanize.Bytes(info.Size()))
 
-	location, err := r.Storage.Upload(ctx, dir, name, f.Name())
+	tracker := progress.FromContext(ctx)
+	tracker.StartUpload(info.Size())
+	location, err := r.Storage.Upload(ctx, dir, name, f.Name(), tracker.AddUploaded)
 	if err != nil {
 		return Result{}, fmt.Errorf("upload: %w", err)
 	}
+	tracker.FileDone()
 	return Result{FileName: name, SizeBytes: info.Size(), Location: location, Files: 1}, nil
 }
 

@@ -24,6 +24,7 @@ import (
 	"oap-backup/internal/api"
 	"oap-backup/internal/backup"
 	"oap-backup/internal/cli"
+	"oap-backup/internal/progress"
 	"oap-backup/internal/runlog"
 	"oap-backup/internal/scheduler"
 )
@@ -37,10 +38,13 @@ type fakeJob struct {
 	logger *slog.Logger
 }
 
-func (f *fakeJob) Run(ctx context.Context, t annotations.Target) (scheduler.RunResult, error) {
+func (f *fakeJob) Run(ctx context.Context, t annotations.Target, tracker *progress.Tracker) (scheduler.RunResult, error) {
 	f.mu.Lock()
 	block, err := f.block, f.err
 	f.mu.Unlock()
+	// A 3 MiB file of which 1.5 MiB is on the storage when the job blocks.
+	tracker.StartUpload(3 << 20)
+	tracker.AddUploaded(3 << 19)
 	log := f.logger.With("target", t.Key(), "folder", t.FileFolder)
 	log.Info("running backup command", "pod", t.Pod, "command", t.Command)
 	defer log.Info("prune complete", "deleted", 0, "kept", 1)
@@ -457,7 +461,7 @@ func TestStatus(t *testing.T) {
 	wantContains(t, out,
 		"2 scheduled, 1 invalid, 1 in progress",
 		"Backup in progress: db/pg-0",
-		"State:", "running for ", "Trigger:", "manual, at ",
+		"State:", "running for ", "Trigger:", "manual, at ", "Uploaded:", "1.5 MiB",
 		"Mode:", "single", "Command:", "pg_dumpall", "Folder:", "db/pg-0", "Compression:", "gzip",
 		"Previous run:", "none since oap-backup started",
 		"Log:", "INFO  backup triggered trigger=manual", "INFO  running backup command folder=db/pg-0")
@@ -487,6 +491,9 @@ func TestStatus(t *testing.T) {
 	p := report.InProgress[0]
 	if p.Target.Key() != "db/pg-0" || p.CurrentRun == nil || p.CurrentRun.Started == nil || p.CurrentRun.Trigger != scheduler.TriggerManual || len(p.Log) != 2 {
 		t.Errorf("in progress = %+v", p)
+	}
+	if pr := p.CurrentRun.Progress; pr == nil || pr.UploadedBytes != 3<<19 || pr.FilesUploaded != 0 {
+		t.Errorf("progress = %+v, want %d bytes", pr, 3<<19)
 	}
 
 	close(block)

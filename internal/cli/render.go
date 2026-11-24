@@ -11,6 +11,7 @@ import (
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/api"
 	"oap-backup/internal/backup"
+	"oap-backup/internal/humanize"
 	"oap-backup/internal/scheduler"
 )
 
@@ -96,7 +97,7 @@ func renderParts(w io.Writer, folders []backup.StoredFolder) {
 		files += n
 		size += s
 	}
-	fmt.Fprintf(w, "Parts on the storage: %d (%s, %s)\n", len(folders), plural(files, "backup"), humanSize(size))
+	fmt.Fprintf(w, "Parts on the storage: %d (%s, %s)\n", len(folders), plural(files, "backup"), humanize.Bytes(size))
 	for _, f := range folders {
 		fmt.Fprintln(w)
 		fmt.Fprintf(w, "Part %s\n", f.Part)
@@ -111,7 +112,7 @@ func renderFolder(w io.Writer, f backup.StoredFolder) {
 		fmt.Fprintf(w, "%s: no files\n", f.Folder)
 		return
 	}
-	line := fmt.Sprintf("%s: %s, %s", f.Folder, plural(n, "backup"), humanSize(size))
+	line := fmt.Sprintf("%s: %s, %s", f.Folder, plural(n, "backup"), humanize.Bytes(size))
 	if newest != nil {
 		line += ", newest " + newest.UTC().Format(timeLayout)
 	}
@@ -127,7 +128,7 @@ func renderFolder(w io.Writer, f backup.StoredFolder) {
 		if !file.Backup {
 			note = "not a backup file: the next run deletes it"
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", file.Name, ts, humanSize(file.SizeBytes), note)
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", file.Name, ts, humanize.Bytes(file.SizeBytes), note)
 	}
 	_ = tw.Flush()
 }
@@ -207,7 +208,7 @@ func uploaded(l *scheduler.LastRun) string {
 	if l.Files == 0 {
 		return "nothing"
 	}
-	return fmt.Sprintf("%s, %s", plural(l.Files, "file"), humanSize(l.SizeBytes))
+	return fmt.Sprintf("%s, %s", plural(l.Files, "file"), humanize.Bytes(l.SizeBytes))
 }
 
 // shortDuration renders d with at most two units: 42s, 5m10s, 3h12m, 2d5h.
@@ -230,22 +231,6 @@ func shortDuration(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%ds", seconds)
 	}
-}
-
-func humanSize(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	value, suffix := float64(n), ""
-	for _, s := range []string{"KiB", "MiB", "GiB", "TiB"} {
-		value /= unit
-		suffix = s
-		if value < unit {
-			break
-		}
-	}
-	return fmt.Sprintf("%.1f %s", value, suffix)
 }
 
 func plural(n int, noun string) string {

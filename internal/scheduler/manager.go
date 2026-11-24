@@ -18,12 +18,14 @@ import (
 
 	"oap-backup/internal/annotations"
 	"oap-backup/internal/metrics"
+	"oap-backup/internal/progress"
 )
 
 // JobRunner runs one complete backup of a target (backup.Runner, adapted in
 // main) and reports what it uploaded.
 type JobRunner interface {
-	Run(ctx context.Context, t annotations.Target) (RunResult, error)
+	// Run reports how much it has sent to the storage through tracker.
+	Run(ctx context.Context, t annotations.Target, tracker *progress.Tracker) (RunResult, error)
 }
 
 // RunResult is what one backup run uploaded.
@@ -64,6 +66,11 @@ type CurrentRun struct {
 	// Started is when the backup itself began. It is nil while the run
 	// waits for a free slot (MaxConcurrent backups are already running).
 	Started *time.Time `json:"started,omitempty"`
+	// Progress is how much the backup has sent to the storage so far. It
+	// is set once the run has started.
+	Progress *progress.Snapshot `json:"progress,omitempty"`
+
+	tracker *progress.Tracker
 }
 
 // InvalidTarget is an opted-in pod that is skipped because of its annotations.
@@ -326,7 +333,7 @@ func (m *Manager) start(key, reason string) (annotations.Target, bool) {
 		return annotations.Target{}, false
 	}
 	m.running[key] = true
-	m.current[key] = &CurrentRun{Trigger: reason, Triggered: time.Now()}
+	m.current[key] = &CurrentRun{Trigger: reason, Triggered: time.Now(), tracker: progress.New()}
 	m.wg.Add(1)
 	m.Logger.Info("backup triggered", "target", key, "trigger", reason)
 	return e.target, true
@@ -359,12 +366,14 @@ func (m *Manager) run(t annotations.Target, trigger string) {
 	defer func() { <-m.sem }()
 
 	started := time.Now()
+	var tracker *progress.Tracker
 	m.mu.Lock()
 	if cur := m.current[t.Key()]; cur != nil {
 		cur.Started = &started
+		tracker = cur.tracker
 	}
 	m.mu.Unlock()
-	res, err := m.Runner.Run(m.jobCtx, t) // the runner logs the outcome
+	res, err := m.Runner.Run(m.jobCtx, t, tracker) // the runner logs the outcome
 	last = &LastRun{Trigger: trigger, Started: started, Finished: time.Now(), Files: res.Files, SizeBytes: res.SizeBytes}
 	if err != nil {
 		last.Error = err.Error()
@@ -406,6 +415,12 @@ func (m *Manager) status(key string, e *entry, now time.Time) TargetStatus {
 	}
 	if cur := m.current[key]; cur != nil {
 		copied := *cur
+		copied.tracker = nil
+		if cur.Started != nil {
+			if snap, ok := cur.tracker.Snapshot(); ok {
+				copied.Progress = &snap
+			}
+		}
 		st.CurrentRun = &copied
 	}
 	return st

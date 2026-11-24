@@ -41,9 +41,13 @@ func exercise(t *testing.T, s Storage) {
 		t.Fatal(err)
 	}
 	for _, n := range []string{"backup-1.sql.gz", "backup-2.sql.gz"} {
-		loc, err := s.Upload(ctx, dir, n, local)
+		var sent int64
+		loc, err := s.Upload(ctx, dir, n, local, func(n int64) { sent += n })
 		if err != nil {
 			t.Fatalf("Upload %s: %v", n, err)
+		}
+		if sent != int64(len("backup-bytes")) {
+			t.Errorf("Upload %s reported %d bytes sent, want %d", n, sent, len("backup-bytes"))
 		}
 		t.Logf("uploaded %s", loc)
 	}
@@ -69,6 +73,25 @@ func exercise(t *testing.T, s Storage) {
 	}
 	if files, err := s.ListFiles(ctx, dir+"/missing"); err != nil || len(files) != 0 {
 		t.Fatalf("ListFiles(missing) = %v, %v; want empty, nil", files, err)
+	}
+
+	// A nil progress callback is allowed.
+	if _, err := s.Upload(ctx, dir, "backup-2.sql.gz", local, nil); err != nil {
+		t.Fatalf("Upload without progress: %v", err)
+	}
+
+	// Uploading the same name again replaces the file, and no temporary
+	// file (FTP uploads as <name>.tmp and renames) is left behind.
+	bigger := filepath.Join(t.TempDir(), "y")
+	if err := os.WriteFile(bigger, []byte("backup-bytes, second version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Upload(ctx, dir, "backup-2.sql.gz", bigger, nil); err != nil {
+		t.Fatalf("Upload over an existing file: %v", err)
+	}
+	files, err = s.ListFiles(ctx, dir)
+	if err != nil || len(files) != 1 || files[0].Name != "backup-2.sql.gz" || files[0].Size != int64(len("backup-bytes, second version")) {
+		t.Fatalf("after re-upload ListFiles = %+v, %v; want only the new backup-2.sql.gz", files, err)
 	}
 
 	// Folders: dir's parent holds exactly one folder; an emptied folder can

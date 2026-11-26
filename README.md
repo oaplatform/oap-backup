@@ -238,6 +238,21 @@ With `oap/backup-external-container-image`, the backup runs in a pod named
 Use a helper pod when the application image has no dump/archive tools.
 `emptyDir` volumes are **not** shared: the helper pod gets a new, empty one.
 
+If the helper pod is not `Running` within `--helper_timeout`, the attempt
+fails with the reason: an unsatisfied `PodScheduled` condition, the
+container's waiting state and the newest `Warning` event of the helper pod
+(needs `list` on `events`), e.g.
+
+```
+helper pod clickhouse-0-backup-helper did not reach Running within 2m0s (last phase="Pending";
+ContainerCreating; FailedMount: MountVolume.SetUp failed for volume "initdb" : configmap
+"clickhouse-initdb" not found): context deadline exceeded
+```
+
+A common cause is a ConfigMap or Secret volume of the source pod that no
+longer exists: the source pod keeps running, but no new pod with that volume
+(the helper, or the source pod after a restart) can start.
+
 ## Partitioned backups
 
 For data that consists of independent parts (table partitions, per-tenant
@@ -574,6 +589,7 @@ Required permissions (ClusterRole, or a Role with `--namespace`):
 | `pods` | `get`, `list`, `create`, `delete` | discovery, helper pods |
 | `pods/exec` | `get`, `create` | run the backup command (WebSocket / SPDY) |
 | `configmaps` | `get` | scripts referenced by `oap/backup-*-command-configmap` |
+| `events` | `list` | why a helper pod did not start (optional; without it the error has no event reason) |
 | `secrets` | `get` | scripts referenced by `oap/backup-*-command-secret`. Not granted by `deploy/rbac.yaml`; see [Scripts in a ConfigMap or Secret](#scripts-in-a-configmap-or-secret). |
 
 Deployment notes:

@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 )
@@ -163,7 +164,8 @@ func (h *Helpers) poll() time.Duration {
 
 // Create starts a helper pod for namespace/pod's container, with env set on
 // its container, and waits until it is Running. A stale helper with the same name is deleted first. On error,
-// any helper pod that was created is deleted again. Returns the helper name.
+// any helper pod that was created is deleted again, and the error says why
+// it did not start (see notRunningReason). Returns the helper name.
 func (h *Helpers) Create(ctx context.Context, namespace, pod, container, image string, env []corev1.EnvVar) (string, error) {
 	src, err := h.Client.CoreV1().Pods(namespace).Get(ctx, pod, metav1.GetOptions{})
 	if err != nil {
@@ -182,28 +184,121 @@ func (h *Helpers) Create(ctx context.Context, namespace, pod, container, image s
 		return "", fmt.Errorf("creating helper pod %s: %w", name, err)
 	}
 
-	var phase corev1.PodPhase
+	var last *corev1.Pod
 	err = wait.PollUntilContextTimeout(ctx, h.poll(), h.Timeout, true, func(ctx context.Context) (bool, error) {
 		p, err := h.Client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
-		phase = p.Status.Phase
-		switch phase {
+		last = p
+		switch p.Status.Phase {
 		case corev1.PodRunning:
 			return true, nil
 		case corev1.PodFailed, corev1.PodSucceeded:
-			return false, fmt.Errorf("helper pod %s terminated (phase=%s)", name, phase)
+			return false, fmt.Errorf("helper pod %s terminated (phase=%s)", name, p.Status.Phase)
 		}
 		return false, nil
 	})
 	if err != nil {
+		// ctx may already be done; diagnostics and cleanup get their own.
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
+		detail := `last phase=""`
+		if last != nil {
+			detail = fmt.Sprintf("last phase=%q", last.Status.Phase)
+		}
+		if why := h.notRunningReason(cleanupCtx, namespace, name, last); why != "" {
+			detail += "; " + why
+		}
 		_ = h.Delete(cleanupCtx, namespace, name)
-		return "", fmt.Errorf("helper pod %s did not reach Running within %s (last phase=%q): %w", name, h.Timeout, phase, err)
+		return "", fmt.Errorf("helper pod %s did not reach Running within %s (%s): %w", name, h.Timeout, detail, err)
 	}
 	return name, nil
+}
+
+// notRunningReason explains, best effort, why helper pod name (last seen as
+// pod, which may be nil) is not Running: an unsatisfied PodScheduled
+// condition, the container's waiting or terminated state, and the newest
+// Warning event of the pod (e.g. FailedMount for a ConfigMap volume that no
+// longer exists). Failing to list events (e.g. no RBAC for it) only leaves
+// that part out.
+func (h *Helpers) notRunningReason(ctx context.Context, namespace, name string, pod *corev1.Pod) string {
+	var parts []string
+	if pod != nil {
+		for _, c := range pod.Status.Conditions {
+			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse {
+				parts = append(parts, reasonText(c.Reason, c.Message))
+			}
+		}
+		for _, cs := range pod.Status.ContainerStatuses {
+			switch {
+			case cs.State.Waiting != nil:
+				parts = append(parts, reasonText(cs.State.Waiting.Reason, cs.State.Waiting.Message))
+			case cs.State.Terminated != nil:
+				t := cs.State.Terminated
+				parts = append(parts, reasonText(fmt.Sprintf("%s (exit code %d)", t.Reason, t.ExitCode), t.Message))
+			}
+		}
+	}
+	if ev := h.lastWarning(ctx, namespace, name, pod); ev != nil {
+		parts = append(parts, reasonText(ev.Reason, ev.Message))
+	}
+	var out []string
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, "; ")
+}
+
+// lastWarning returns the newest Warning event of helper pod name, or nil.
+// When pod has a UID, events of earlier helpers with the same name (previous
+// attempts) are skipped.
+func (h *Helpers) lastWarning(ctx context.Context, namespace, name string, pod *corev1.Pod) *corev1.Event {
+	list, err := h.Client.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fields.Set{"involvedObject.kind": "Pod", "involvedObject.name": name}.String(),
+	})
+	if err != nil {
+		return nil
+	}
+	var newest *corev1.Event
+	for i := range list.Items {
+		ev := &list.Items[i]
+		if ev.Type != corev1.EventTypeWarning || ev.InvolvedObject.Kind != "Pod" || ev.InvolvedObject.Name != name {
+			continue
+		}
+		if pod != nil && pod.UID != "" && ev.InvolvedObject.UID != "" && ev.InvolvedObject.UID != pod.UID {
+			continue
+		}
+		if newest == nil || !eventTime(ev).Before(eventTime(newest)) {
+			newest = ev
+		}
+	}
+	return newest
+}
+
+func eventTime(ev *corev1.Event) time.Time {
+	switch {
+	case !ev.LastTimestamp.IsZero():
+		return ev.LastTimestamp.Time
+	case !ev.EventTime.IsZero():
+		return ev.EventTime.Time
+	case !ev.FirstTimestamp.IsZero():
+		return ev.FirstTimestamp.Time
+	}
+	return ev.CreationTimestamp.Time
+}
+
+func reasonText(reason, message string) string {
+	reason, message = strings.TrimSpace(reason), strings.TrimSpace(message)
+	switch {
+	case message == "":
+		return reason
+	case reason == "":
+		return message
+	}
+	return reason + ": " + message
 }
 
 // Delete deletes a helper pod immediately; a missing pod is not an error.

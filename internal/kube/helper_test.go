@@ -2,13 +2,17 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -158,10 +162,90 @@ func TestHelpersCreateFailedPod(t *testing.T) {
 		return false, nil, nil
 	})
 	h := &Helpers{Client: client, Timeout: time.Second, PollInterval: 10 * time.Millisecond}
-	if _, err := h.Create(context.Background(), "db", "mongo-0", "mongo", "bad:image", nil); err == nil {
-		t.Fatal("want error for failed helper pod")
+	_, err := h.Create(context.Background(), "db", "mongo-0", "mongo", "bad:image", nil)
+	if err == nil || !strings.Contains(err.Error(), `last phase="Failed"`) {
+		t.Fatalf("want error for failed helper pod with its phase, got %v", err)
 	}
 	if _, err := client.CoreV1().Pods("db").Get(context.Background(), "mongo-0-backup-helper", metav1.GetOptions{}); err == nil {
 		t.Error("failed helper pod must be deleted")
+	}
+}
+
+func helperEvent(name, uid, reason, message string, at time.Time) *corev1.Event {
+	return &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "db", Name: name},
+		InvolvedObject: corev1.ObjectReference{Kind: "Pod", Namespace: "db",
+			Name: "mongo-0-backup-helper", UID: types.UID(uid)},
+		Type: corev1.EventTypeWarning, Reason: reason, Message: message,
+		LastTimestamp: metav1.NewTime(at),
+	}
+}
+
+// A helper that stays Pending reports why: scheduling condition, container
+// waiting state and the newest Warning event of this helper.
+func TestHelpersCreatePendingReason(t *testing.T) {
+	now := time.Now()
+	const mountMsg = `MountVolume.SetUp failed for volume "initdb" : configmap "clickhouse-initdb" not found`
+	cases := []struct {
+		name      string
+		status    corev1.PodStatus
+		forbidden bool
+		want      []string
+		notWant   []string
+	}{{
+		name: "failed mount",
+		status: corev1.PodStatus{Phase: corev1.PodPending, ContainerStatuses: []corev1.ContainerStatus{{
+			Name: HelperContainer, State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}}}}},
+		want:    []string{`last phase="Pending"`, "; ContainerCreating;", "FailedMount: " + mountMsg},
+		notWant: []string{"older", "previous helper"},
+	}, {
+		name:      "events forbidden",
+		status:    corev1.PodStatus{Phase: corev1.PodPending, ContainerStatuses: []corev1.ContainerStatus{{Name: HelperContainer, State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "Back-off pulling image"}}}}},
+		forbidden: true,
+		want:      []string{`last phase="Pending"`, "ImagePullBackOff: Back-off pulling image"},
+		notWant:   []string{"FailedMount"},
+	}, {
+		name: "unschedulable",
+		status: corev1.PodStatus{Phase: corev1.PodPending, Conditions: []corev1.PodCondition{{
+			Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: "Unschedulable", Message: "0/1 nodes are available"}}},
+		want: []string{"Unschedulable: 0/1 nodes are available"},
+	}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewClientset(sourcePod(),
+				helperEvent("e1", "uid-1", "FailedMount", "older", now.Add(-time.Minute)),
+				helperEvent("e2", "uid-1", "FailedMount", mountMsg, now),
+				helperEvent("e3", "uid-0", "FailedMount", "previous helper", now.Add(time.Minute)),
+			)
+			client.PrependReactor("create", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				p := a.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+				p.UID = "uid-1"
+				p.Status = tc.status
+				return false, nil, nil
+			})
+			if tc.forbidden {
+				client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "events"}, "", errors.New("no RBAC"))
+				})
+			}
+			h := &Helpers{Client: client, Timeout: 50 * time.Millisecond, PollInterval: 10 * time.Millisecond}
+			_, err := h.Create(context.Background(), "db", "mongo-0", "mongo", "mongo:8", nil)
+			if err == nil {
+				t.Fatal("want error for pending helper pod")
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not contain %q", err, w)
+				}
+			}
+			for _, w := range tc.notWant {
+				if strings.Contains(err.Error(), w) {
+					t.Errorf("error %q must not contain %q", err, w)
+				}
+			}
+			if _, err := client.CoreV1().Pods("db").Get(context.Background(), "mongo-0-backup-helper", metav1.GetOptions{}); err == nil {
+				t.Error("pending helper pod must be deleted")
+			}
+		})
 	}
 }

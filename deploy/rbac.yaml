@@ -30,6 +30,11 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]
+  # explain why a helper pod did not reach Running (e.g. FailedMount);
+  # optional, only used in that error message
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
   # Scripts in Secrets (oap/backup-command-secret, oap/backup-parts-command-secret)
   # are NOT enabled here: in a ClusterRole this rule lets oap-backup read every
   # Secret in the cluster. Uncomment it only if that is acceptable. Otherwise
